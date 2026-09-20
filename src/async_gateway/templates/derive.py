@@ -29,13 +29,14 @@ from urllib.parse import urlparse
 
 import yaml
 
-from ..config import load_strategy_defaults
+from ..config import get_settings, load_strategy_defaults
 from .schema import (
     Capabilities,
     ConfirmStrategy,
     FieldSource,
     NormalizationRules,
     ResolvedTemplate,
+    ResultMode,
     ResultPolicy,
     StatusSource,
     StrategyOverride,
@@ -169,6 +170,14 @@ def resolve(
     note("capabilities", None, src if draft.capabilities else dfl)
     result_policy = draft.result_policy or ResultPolicy()
     note("result_policy", None, src if draft.result_policy else dfl)
+    if "mode" not in (draft.result_policy.model_fields_set if draft.result_policy else frozenset()):
+        # 模板未显式声明结果策略模式 → 取**全局默认**（``AG_RESULT_MODE_DEFAULT``）。
+        # 用 model_fields_set 区分"真的没写"与"写了 store"：后者必须原样保留（作者显式优先），
+        # 否则"先默认不转存、验证完再逐模板切回 store"这条路会走不通。
+        result_policy = result_policy.model_copy(
+            update={"mode": ResultMode(get_settings().result_mode_default)}
+        )
+        prov["result_policy.mode"] = dfl
     pool = note("pool", draft.pool or "shared", src if draft.pool else dfl)
     status_source = note(
         "status_source",

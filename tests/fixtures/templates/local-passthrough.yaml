@@ -1,0 +1,27 @@
+# passthrough 结果策略：不转存，结果字段保留上游直链。
+# 用于验证（a）显式声明优先于全局默认；（b）结果端点在 passthrough 下必须 409，
+# 而不是误返 202「转存中」——后者会让调用方无限重试一个永不发生的转存。
+alias: echo-pass
+base_url: http://localhost:9099
+create_path: /v1/tasks
+result_location: $.output.url
+id_location: $.task_id
+status_field: $.status
+terminal:
+  success: [succeeded]
+  failure: [failed]
+  expired: [expired]
+capabilities:
+  upstream_idempotent: false
+  confirm_strategy: query_by_client_key
+  cancel: false
+  callback: false
+  per_key_isolation: true
+result_policy:
+  mode: passthrough
+normalize:
+  fields: [prompt]
+strategy:
+  deadline_seconds: 120
+  max_attempts: 1
+pool: light-poll

@@ -2,7 +2,7 @@
 PY ?= /Users/betterme/.workbuddy/binaries/python/envs/async-gateway/bin/python
 
 .PHONY: help install test test-all lint gateway worker scheduler inspector admin migrate revision
-.PHONY: compose-up compose-down
+.PHONY: compose-up compose-down live-seed3d
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -36,6 +36,9 @@ migrate: ## 执行数据库迁移
 
 revision: ## 生成迁移（make revision m="add xxx"）
 	$(PY) -m alembic revision --autogenerate -m "$(m)"
+
+live-seed3d: ## 真机联调：经网关跑一次图生 3D（需 ARK_API_KEY；会消耗上游额度）
+	$(PY) scripts/live_seed3d.py --interval 10
 
 compose-up: ## 起全部依赖与进程（需要 Docker）
 	docker compose up -d --build

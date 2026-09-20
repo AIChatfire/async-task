@@ -210,3 +210,52 @@ async def test_stream_bus_roundtrip_and_dlq(settings):
     assert await bus.pending("unit") == 0
     entries = await bus.claim_stale("unit", consumer="c2", min_idle_ms=0, count=5)
     assert isinstance(entries, list)
+
+
+# __ 结果存储：桶缺失不得静默建桶 __
+def test_minio_store_does_not_auto_create_bucket():
+    """桶缺失属部署配置错误：必须立刻失败，不得静默 `make_bucket`。
+
+    结果桶通常是部署侧预建的**共享桶**（可能挂 CDN 与既有策略）。若网关在桶名配错时
+    自动建桶，结果会写进一个没人管理的新桶里 —— 既不报警、也不可发现。
+    """
+    from types import SimpleNamespace
+
+    from async_gateway.infra.object_store import MinioResultStore
+
+    store = MinioResultStore.__new__(MinioResultStore)  # 跳过 __init__（避免连真实存储）
+    store.bucket = "cdn"
+    store._bucket_ready = False
+    created: list[str] = []
+    store.client = SimpleNamespace(
+        bucket_exists=lambda name: False,
+        make_bucket=lambda name: created.append(name),
+    )
+
+    with pytest.raises(RuntimeError, match="not available"):
+        store._ensure_bucket()
+    assert created == []  # 关键：绝不去建桶
+
+
+def test_result_key_prefixes_creation_date():
+    """结果 key 一级前缀 = 任务**创建日期（UTC）**，便于按天分目录/生命周期清理。"""
+    from datetime import UTC, datetime, timedelta, timezone
+
+    from async_gateway.infra.object_store import result_key
+
+    created = datetime(2026, 9, 20, 23, 30, tzinfo=UTC)
+    assert result_key("default", "t1", created_at=created) == "20260920/default/t1/attempt-1.bin"
+
+    # 时区必须折算到 UTC：东八区 09-21 00:30 == UTC 09-20 16:30
+    cst = timezone(timedelta(hours=8))
+    assert (
+        result_key("default", "t1", created_at=datetime(2026, 9, 21, 0, 30, tzinfo=cst))
+        == "20260920/default/t1/attempt-1.bin"
+    )
+
+    # naive 时间按 UTC 解释（不随部署机器时区漂移）；attempt / ext 可覆盖
+    naive = datetime(2026, 9, 20, 1, 0)
+    assert (
+        result_key("d", "t2", created_at=naive, attempt=3, ext="glb")
+        == "20260920/d/t2/attempt-3.glb"
+    )

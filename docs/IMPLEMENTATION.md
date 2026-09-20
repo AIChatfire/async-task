@@ -2,7 +2,7 @@
 
 > 对应架构文档：`docs/async-gateway-architecture-v3.md`（v3.0）
 > 代码根目录：`src/async_gateway/`
-> 测试：`tests/`（184 项，全绿；其中 5 项为 Redis 真机用例）
+> 测试：`tests/`（199 项，全绿；其中 5 项为 Redis 真机用例）
 
 本文只讲三件事：**文档的哪一条落在哪个文件**、**哪些地方我做了裁定（以及为什么）**、
 **哪些还没验证**。第三部分请务必读完再评估可用性。
@@ -175,6 +175,97 @@ SQLite 不支持带时区时间戳，读回来是 naive，于是所有"是否到
 | 取消路径匹配依赖 `capabilities.cancel` | 上游不支持取消时 DELETE 返回 404，等于对外承诺里少了"取消" | `test_cancel_degrades_when_upstream_cannot_cancel` |
 | 包属性 `app` 遮蔽 `admin.app` 子模块 | `uvicorn async_gateway.admin.app:app` 这类按模块路径加载的入口会解析到错误对象 | 复查 `admin/__init__.py` |
 
+### 3.11 真机联调（火山方舟图生 3D）抓到的三个缺陷（都已修）
+
+2026-09-20 用真实方舟 `doubao-seed3d-2-0-260328` 经网关跑通一次（脚本
+`scripts/live_seed3d.py`；详见 `docs/newapi-task-plugin-integration.md` §8）。三个缺陷都只在
+"真实上游 + 真实产物"下才会暴露：
+
+| 缺陷 | 后果 | 触发条件 |
+|---|---|---|
+| 结果字段照抄 New API 插件 README 的 `$.content.url` | 任务 succeeded 但"结果 url not extractable" | 直连方舟时产物在 `content.file_url`（`content.url` 是其 BFF 归一化后的形状） |
+| 响应体入口脱敏把预签名 URL 的签名抹成 `***redacted***`，而快照就是转存取 URL 的唯一来源 | 转存永久失败 → `result_degraded=['transfer_failed']` → 结果端点 410 | 上游结果 URL 带签名查询串（TOS 预签名，踩中 `_SECRET_SHAPES` 的 32+ 字符兜底规则） |
+| 结果**文件**拉取上限与上游 API 响应上限共用硬编码 4 MiB | 41 MB 产物必然"result too large"，同样落到 410 | 3D/视频类产物本体远大于 JSON 状态响应 |
+
+修复要点（都在配置面与数据面，不改变对外契约）：
+
+1. 模板 `result_location` 用实测值（提取表达式属纯勘误，可就地修订、存量任务即时恢复）。
+2. `UpstreamResponse` 保留一份**未脱敏**原始体（`raw_json_body`）；写快照时只对
+   **结果字段**回填原始值，其余字段与一切对外输出仍走脱敏（§17 C2 防护不变）。
+3. 新增 `AG_RESULT_MAX_BYTES`（默认 256 MiB）与 `max_response_bytes`（JSON 响应，4 MiB）解耦；
+   大小超限判为**不可重试**的确定性失败。
+
+第 2、3 条经**变异验证**：临时移除修复后回归用例确实变红。注意假上游也必须校验签名
+（`FakeUpstream.result_expected_signature`）—— 否则 `MockTransport` 只看路径，
+"签名被抹"这一缺陷在测试里测不出来（这一点是第一次变异验证失败才发现并补上的）。
+
+### 3.12 方舟系模板的路径口径与 New API 任务插件对齐
+
+New API 的任务插件是**单文件 JS**，上游路径是**硬编码**的
+（`volcengine-ark-3d`：`ctx.baseUrl + "/api/v3/contents/generations/tasks"`）；插件作者只能通过
+渠道 base_url 换上游，改不了这段后缀。而网关按 alias 之后的剩余路径与 `create_path` **逐字**比对归位。
+因此方舟系模板统一采取「`base_url` 收到站点根 + `/api/v3` 并进 `create_path`」，
+让「渠道 base_url 指向网关 → **零改插件复用**」与「直连上游 URL 不变」同时成立。
+
+`tests/test_templates.py::test_ark_templates_align_with_newapi_plugin_path` 对**全部**方舟系模板
+（`volc-seedance` / `volc-seed3d`）守住这条约束 —— 新增同族上游时若口径写错会立刻变红。
+
+⚠️ 可复用的只有**同构**插件：`aivideomaker`、`senseaudio-video` 的**入站**契约虽然也是方舟原生格式，
+但其**上游**是各自第三方服务（`/api/v1/generate/{model}`、`/v1/video/create`），
+把渠道 base_url 指向本网关后它们要的路径不是方舟路径，因此**不能**用来接方舟上游。
+
+### 3.13 结果策略默认取 `passthrough`（先不转存）
+
+**裁定**：`ResultPolicy.mode` 的全局默认改为可配项 `AG_RESULT_MODE_DEFAULT`，**当前默认 `passthrough`**
+（不转存、结果字段直接给上游直链）。理由：转存链路依赖两件在本环境**尚未验证**的事 ——
+对象存储（MinIO 未连真机、预签名与桶加密未实测）与"存储地址对调用方可达"（New API 会对结果 URL
+及其每次重定向做 SSRF 校验），而上游产物常见几十 MB。先直链让链路一次跑通，
+待对象存储验完再**按模板/渠道逐个**显式切回 `store`。
+
+实现要点（两处都踩过）：
+
+1. `templates/derive.py` 用 `model_fields_set` 区分"真的没写 `mode`"与"写了 `mode: store`"——
+   否则一旦默认切到 passthrough，模板再想显式切回 store 也会被全局默认盖掉（**切不回去**）。
+2. `gateway/routes.py:get_result` 的 passthrough 判定**必须前置**在 `result_ref is None` 之前：
+   passthrough 下 `result_ref` 永远为空，判定若在其后，成功任务会拿到 `202 转存中`，
+   调用方会无限重试一个永不发生的转存。已修，并有变异验证过的回归用例
+   （`test_passthrough_keeps_upstream_url_and_results_endpoint_is_409`）。
+
+**代价（必须知情）**：结果链接依赖上游有效期（火山 TOS 预签名 24h），且上游直链会暴露给调用方
+（envelope `degraded[]` 会声明 `passthrough_result`）。若要求"对外只给自有链接"，
+则需要转存链路，即回到 `store` 并先解决对象存储侧的验证项。
+
+测试基座（`tests/conftest.py`）显式把默认设为 `store`，以保持既有用例"成功即转存"的语义；
+"默认取配置"这条逻辑由 `test_result_mode_default_comes_from_settings` 单独覆盖。
+
+### 3.14 结果获取不走独立端点（已移除 `/results/{task_id}`）
+
+原实现里 store 模式把结果字段重写为 `{AG_CALLBACK_BASE_URL}/results/{task_id}`，再由该端点 302 到
+对象存储的预签名 URL。它同时踩了三条：
+
+| 问题 | 说明 |
+|---|---|
+| 违背动态路由原则 | `gateway/routing.py` 开篇即是"网关**不能**靠固定端点表路由，而要把剩余路径拿去和模板对照"；而它是全体系**唯一**的固定端点 |
+| 用内部主键当能力 URL | 路径参数是 `async_task` 主键，该值还会经 `X-AG-Task-Id` 响应头外露 ⇒ 可被枚举取件 |
+| 归属校验形同虚设 | `x-ag-channel` 带了才校验、不带直接放行 ⇒ 匿名可读；与 §18.x「代理读须带归属校验」不符，也与 New API 插件的 `credentialless` 回源**直接冲突**（加严校验会让插件取件 404） |
+
+**裁定**：按 §12.2 首选改为**结果直给** —— store 模式下查询响应里的结果字段就是对象存储的预签名 URL
+（`routes._presigned_result_url` 由 `result_ref` 现算）。网关对外**只透传上游原生路径**
+（提交/查询/取消），不再发明任何结果路径。连带变化：
+
+- 移除 `RESULT_ENDPOINT` / `result_endpoint_url`；`build_native_query_response` 的入参由
+  `public_base_url` 改为 `result_url`（调用方预先算好，函数保持纯同步，便于测试）；
+- "结果不可用"不再靠 410 表达：**结果字段留空** + `_result_hint`，语义由 envelope 的
+  `degraded[]`（`result_pending` / `result_unavailable`）承担；
+- 附带消掉一处语义混用：结果 URL 原先借用 `AG_CALLBACK_BASE_URL`（**回调**基址）拼接，
+  现已不需要该基址 —— 它现在只用于回调地址拼接；
+- 相关用例改写为"从查询响应取结果"：`test_store_mode_query_gives_presigned_url`、
+  `test_store_mode_result_field_empty_when_transfer_failed`、
+  `test_passthrough_keeps_upstream_url_in_query_response`（并断言该路径已 404）。
+
+若将来确有"网关代理读"需求（Range 透传 / 隐藏桶），须以**带归属校验**的独立形态重新引入
+（§12.2 / §485 的备选），不得回到匿名 + 内部主键的形态。
+
 冒烟脚本：`scripts/smoke_workers.py`（起 scheduler 2 tick → inspector 1 tick → worker 消费并 ACK 一条消息，
 走真实 Redis Streams 消费组）。实测输出：`SMOKE OK`。
 
@@ -187,9 +278,10 @@ SQLite 不支持带时区时间戳，读回来是 naive，于是所有"是否到
 | 项 | 状态 |
 |---|---|
 | **Postgres** | 本机没有。全部测试跑 SQLite。`alembic/versions/0001_initial.py` 未执行过；`scripts/partition_async_task.sql`（月度分区 + DETACH 归档）**未执行**，是按文档产出的运维工件，必须先在 PG 上演练 |
-| **MinIO** | `MinioResultStore` 未连真机（测试用 `MemoryResultStore`，接口一致）。预签名 URL、SSE-S3 桶加密均未实测 |
+| **MinIO / 对象存储** | ✅ 2026-09-20 已连真机并跑通 **store 端到端**（`oss.s3ai.cn` / 桶 `cdn`）：真实转存 42.4 MB 产物 → `result_ref=20260920/{tenant}/{task_id}/attempt-1.bin` → 查询响应里结果字段 = 该对象的**预签名 URL** → `Range` 取回 **HTTP 206**；另改为**不自动建桶**（见 `test_minio_store_does_not_auto_create_bucket`）。🔻**桶读权限已确认保持公开**（`Principal:*` 的 `s3:GetObject` + `s3:ListBucket`）⇒ 转存产物属**公开资源、且可被枚举**，此为**有意取舍**（勿放敏感产物）。SSE-S3 桶加密、留存到期清理仍未接线 |
 | **Docker / K8s** | 本机无 docker CLI，`docker compose up` 未跑过；`Dockerfile` 尚未补（compose 已引用）。HPA 复合指标、探针、单副本约束都只是配置声明 |
 | **Logfire** | 未配 token；`logfire.configure` 分支未执行。指标走内置注册表 + `/metrics`（Prometheus 文本格式），未接真实采集 |
+| **真实上游（火山方舟）** | ✅ 2026-09-20 已**完整端到端**验证：`doubao-seed3d-2-0-260328` 图生 3D 经网关跑通两次（端到端 4m38s / 4m48s）——受理原生形状 → 轮询 → 终态 → 结果字段（含签名）→ 直链抽检 `HTTP 206` / 42.4 MB 可取，当前默认 `passthrough`。脚本 `scripts/live_seed3d.py`，记录见 `docs/newapi-task-plugin-integration.md` §8。**其余上游（Seedance 视频等）仍未真机跑过**；`store`（转存）路径的真机验证只有一次（见 §3.11），且对象存储未连真机 |
 | **New API 侧** | 完全没有联调。§16 的"状态输出契约"只在网关侧自证（原生形状、内部终态重写、结果字段重写都已测），**M3 出口要求的"New API adaptor 对转存永久失败形状不误判为 failed"未验证** |
 
 ### 4.2 实现上的已知缺口
@@ -225,10 +317,10 @@ SQLite 不支持带时区时间戳，读回来是 naive，于是所有"是否到
 
 | # | 验收项 | 状态 |
 |---|---|---|
-| 1 | 新约定型上游 = 4 行模板 + 渠道持证 + dry-run，零代码 | ✅ 代码零改动；`test_templates.py` + `test_admin.py::test_dry_run_*` |
+| 1 | 新约定型上游 = 4 行模板 + 渠道持证 + dry-run，零代码 | ✅ 代码零改动；第二个上游 `volc-seed3d`（图生 3D）就是 4 行模板接入，且已按 New API 任务插件的拼接口径对齐并经真机跑通（`tests/test_volc_seed3d.py`） |
 | 2 | 同幂等键同 attempt 只产生一个上游任务 | ✅ `test_derived_idempotency_key_makes_resubmit_a_replay` |
 | 3 | 重启不丢任务；accepted 悬挂按提交意图分流；创建超时进 unknown 且补偿收敛；状态输出单调不翻转 | ✅ 分流两子项 + 单调性 + 重复查询一致均已测；**重启不丢**只覆盖到"Redis 丢消息 → scheduler 重投"这一层 |
-| 4 | store 模式留存期内结果可回读；到期/删除 410 | ⚠️ 可回读 + 410 已测（内存存储）；**留存到期清理任务未实现**（无定时任务） |
+| 4 | store 模式留存期内结果可回读；到期/删除后不可读 | ⚠️ 可回读已测（内存存储；结果在查询响应里直给预签名 URL）。**留存到期清理任务未实现**（无定时任务）；到期/删除后由对象存储侧失效，不再有 410 语义（见 §3.14） |
 | 5 | 单 task_id 全链路可查；核心指标/SLI/告警齐备 | ⚠️ 指标注册表 + `/metrics` 有；**Logfire 链路与告警规则未接** |
 | 6 | Task-admin SSO+RBAC+职责分离；全操作审计 append-only；无绕过校验器的通道 | ✅ 除 SSO 真实对接（当前是 OIDC 中间件注入头的契约） |
 | 7 | capabilities 全字段声明 + degraded[] 显式降级 | ✅ `test_envelope_only_when_requested` |
@@ -267,5 +359,7 @@ src/async_gateway/
   admin/                    治理面（RBAC、双人复核、模板、重放、dry-run、审计）
   observability/            日志（强制脱敏）与指标
 alembic/                    迁移（0001_initial 用 metadata 建表 + PG 审计权限收口）
+scripts/live_seed3d.py             真机联调：经网关跑一次图生 3D（含 New API 插件的同口径路径）
+scripts/smoke_workers.py           后台进程冒烟（scheduler/inspector/worker 各一轮，真实 Redis Streams）
 scripts/partition_async_task.sql   月度分区与 DETACH 归档（未执行，需演练）
 ```

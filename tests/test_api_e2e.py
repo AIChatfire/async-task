@@ -319,28 +319,34 @@ async def test_cancel_degrades_when_upstream_cannot_cancel(client, container, db
 
 
 # ---------------------------------------------------------------- 结果端点
-async def test_result_endpoint_redirects_to_presigned_url(client, container, fake_upstream, db):
+async def test_store_mode_query_gives_presigned_url(client, container, fake_upstream, db):
+    """store 模式：结果由**查询路径的响应字段**给出（对象存储预签名 URL），不经网关中转端点。"""
     created = await _create(client)
     upstream_id = created.headers["x-ag-upstream-id"]
     task_id = created.headers["x-ag-task-id"]
     fake_upstream.set_status(upstream_id, "succeeded")
 
-    query = await client.get(f"/async/echo/v1/tasks/{upstream_id}", headers=AUTH)
-    body = query.json()
-    assert body["status"] == "succeeded"
-    # 结果字段被重写为网关结果端点（转存回引用）
-    assert body["output"]["url"].endswith(f"/results/{task_id}")
+    # 转存尚未完成：状态已是上游原生成功终态，但结果字段为空（不伪造失败、也不给坏 URL）
+    pending = await client.get(f"/async/echo/v1/tasks/{upstream_id}", headers=AUTH)
+    assert pending.json()["status"] == "succeeded"
+    assert pending.json()["output"]["url"] is None
+    assert pending.json()["_result_hint"] == "unavailable_or_pending"
 
     await _drain(container.bus, TRANSFER_QUEUE, container)
     task = await _task(task_id)
     assert task.result_ref is not None
 
-    response = await client.get(f"/results/{task_id}")
-    assert response.status_code == 302
-    assert "memory://results" in response.headers["location"]
+    # 转存完成后再次查询：结果字段**直接**是预签名 URL
+    done = await client.get(f"/async/echo/v1/tasks/{upstream_id}", headers=AUTH)
+    url = done.json()["output"]["url"]
+    assert url is not None and task.result_ref in url
+    # 指向对象存储，而**不是**网关自己的地址（网关已不再提供结果端点）
+    assert url.startswith("memory://")
+    assert "gw.test" not in url
 
 
-async def test_result_endpoint_410_when_transfer_failed(client, container, fake_upstream, db):
+async def test_store_mode_result_field_empty_when_transfer_failed(client, container, fake_upstream, db):
+    """转存永久失败：保持 succeeded（不伪造失败骗退款），结果字段留空 + hint（不再有 410 端点）。"""
     created = await _create(client)
     upstream_id = created.headers["x-ag-upstream-id"]
     task_id = created.headers["x-ag-task-id"]
@@ -355,22 +361,13 @@ async def test_result_endpoint_410_when_transfer_failed(client, container, fake_
         await _drain(container.bus, TRANSFER_QUEUE, container)
 
     task = await _task(task_id)
-    assert task.status == TaskStatus.SUCCEEDED.value  # 保持 succeeded，不伪造失败骗退款
+    assert task.status == TaskStatus.SUCCEEDED.value  # 保持 succeeded
     assert task.result_degraded == ["transfer_failed"]
 
-    response = await client.get(f"/results/{task_id}")
-    assert response.status_code == 410
-
-
-async def test_result_endpoint_202_while_pending(client, container, fake_upstream, db):
-    created = await _create(client)
-    upstream_id = created.headers["x-ag-upstream-id"]
-    task_id = created.headers["x-ag-task-id"]
-    fake_upstream.set_status(upstream_id, "succeeded")
-    await client.get(f"/async/echo/v1/tasks/{upstream_id}", headers=AUTH)
-    response = await client.get(f"/results/{task_id}")
-    assert response.status_code == 202
-    assert response.headers["Retry-After"] == "5"
+    queried = await client.get(f"/async/echo/v1/tasks/{upstream_id}", headers=AUTH)
+    assert queried.json()["status"] == "succeeded"
+    assert queried.json()["output"]["url"] is None
+    assert queried.json()["_result_hint"] == "unavailable_or_pending"
 
 
 # ---------------------------------------------------------------- 直配与卫生
@@ -419,3 +416,35 @@ async def test_readyz_reports_db_status(client, db):
     response = await client.get("/readyz")
     assert response.status_code == 200
     assert response.json()["db"] is True
+
+
+async def test_passthrough_keeps_upstream_url_in_query_response(client, container, fake_upstream, db):
+    """passthrough（当前全局默认）不转存：结果字段留上游直链，直接从查询响应取用。
+
+    这条同时守两件事：① 结果字段不能被入口脱敏破坏（签名必须原样返回）；
+    ② 网关不得再暴露任何独立"结果端点"——固定端点已随动态路由原则移除。
+    """
+    created = await client.post("/async/echo-pass/v1/tasks", json={"prompt": "x"}, headers=AUTH)
+    assert created.status_code == 200
+    task_id = created.headers["x-ag-task-id"]
+    upstream_id = created.headers["x-ag-upstream-id"]
+
+    # 直链带签名：passthrough 下它就是**交付物本身**，必须原样返回（签名不得被脱敏抹掉）
+    signed_url = f"{fake_upstream.base_url}/files/model.zip?X-Tos-Signature={'0' * 64}"
+    fake_upstream.tasks[upstream_id]["output"]["url"] = signed_url
+    fake_upstream.set_status(upstream_id, "succeeded")
+    await _drain(container.bus, "poll:light-poll", container)
+
+    task = await _task(task_id)
+    assert task is not None
+    assert task.status == TaskStatus.SUCCEEDED.value
+    assert task.result_ref is None  # 不转存
+    assert task.result_degraded is None  # 也不算"转存失败"
+
+    # 查询响应：上游原生形状 + 结果字段保持上游直链（未被重写为网关端点、签名未被脱敏破坏）
+    queried = await client.get(f"/async/echo-pass/v1/tasks/{upstream_id}", headers=AUTH)
+    assert queried.status_code == 200
+    assert queried.json()["output"]["url"] == signed_url
+
+    # 不存在独立结果端点：只透传上游原生路径
+    assert (await client.get(f"/results/{task_id}")).status_code == 404

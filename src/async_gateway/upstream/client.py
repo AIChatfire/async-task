@@ -34,6 +34,16 @@ class UpstreamResponse:
     headers: dict[str, str]
     json_body: Any | None
     text: str
+    #: 未脱敏的原始响应体。**仅供数据面内部 IO**（结果 URL 提取与转存）。
+    #:
+    #: 为什么必须留一份原始值：上游的结果 URL 常带签名查询串（如火山 TOS
+    #: 预签名），而响应体在进入网关时已按 §17 做"凭证形态"脱敏——签名长串正好命中
+    #: :data:`security.redaction._SECRET_SHAPES` 的兜底规则，会被抹成 ``***redacted***``。
+    #: 若快照里存的是脱敏值，转存拿到的就是**不可用的 URL**，表现为
+    #: ``succeeded`` + ``result_degraded=['transfer_failed']`` + 结果端点 410。
+    #: 因此"结果字段回填原始值"是数据面正确性要求；对外输出（日志/审计/HTTP 响应）
+    #: 一律仍用 :attr:`json_body`。
+    raw_json_body: Any | None = None
 
     @property
     def ok(self) -> bool:
@@ -125,12 +135,15 @@ class UpstreamClient:
         client: httpx.AsyncClient | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         max_response_bytes: int = 4 * 1024 * 1024,
+        max_result_bytes: int | None = None,
     ) -> None:
         s = get_settings()
         self.auth_header = auth_header or s.upstream_auth_header
         self.pin_dns = s.ssrf_pin_dns if pin_dns is None else pin_dns
         self.allow_hosts = allow_hosts if allow_hosts is not None else s.ssrf_allow_hosts
         self.max_response_bytes = max_response_bytes
+        #: 结果**文件**拉取上限：与 API 响应上限解耦（3D/视频产物常见几十 MB）。
+        self.max_result_bytes = max_result_bytes if max_result_bytes is not None else s.result_max_bytes
         self._external_client = client is not None
         self._client = client
         #: 默认 transport（测试注入 mock / 生产注入出口代理）；优先级：call 参数 > 默认 > pin
@@ -230,6 +243,7 @@ class UpstreamClient:
             headers={k.lower(): v for k, v in response.headers.items()},
             json_body=scrub_payload(parsed, self.secrets) if parsed is not None else None,
             text=scrub_text(raw.decode("utf-8", errors="replace"), self.secrets),
+            raw_json_body=parsed,
         )
         if up.ok:
             return UpstreamCallResult(outcome="ok", response=up, target=target)
@@ -267,7 +281,7 @@ class UpstreamClient:
         active_client = client or self._client
         if active_client is None:
             active_client = self._ensure_client(transport)
-        limit = max_bytes or self.max_response_bytes
+        limit = max_bytes or self.max_result_bytes
         try:
             response = await active_client.get(
                 url,

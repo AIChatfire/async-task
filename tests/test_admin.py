@@ -25,8 +25,8 @@ NOBODY = {"X-AG-Admin-Token": ADMIN_TOKEN, "X-AG-Actor": "eve", "X-AG-Roles": "o
 
 MINIMAL = {
     "alias": "volc-seedance",
-    "base_url": "https://ark.cn-beijing.volces.com/api/v3",
-    "create_path": "/contents/generations/tasks",
+    "base_url": "https://ark.cn-beijing.volces.com",
+    "create_path": "/api/v3/contents/generations/tasks",
     "result_location": "$.content.video_url",
 }
 

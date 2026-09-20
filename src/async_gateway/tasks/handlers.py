@@ -561,6 +561,8 @@ async def _handle_poll_result(
     snapshot = _snapshot_with_status(body, template, native)
 
     if mapped is TaskStatus.SUCCEEDED:
+        # 结果字段回填上游原始值：脱敏后的签名 URL 不可用，转存会永久失败
+        _restore_raw_result_field(snapshot, template, result)
         ok = await _apply(
             "advance", task.task_id, TaskStatus.SUCCEEDED, expected=expected,
             raw_status=native, status_snapshot=snapshot, status_snapshot_at=_now(),
@@ -617,6 +619,31 @@ def _snapshot_with_status(body: Any, template: ResolvedTemplate, native: str) ->
     except PathWriteSkipped:
         pass
     return body
+
+
+def _restore_raw_result_field(snapshot: Any, template: ResolvedTemplate, result) -> None:
+    """把快照里**结果字段**的取值换回上游原始值（其余字段保持脱敏）。
+
+    上游结果 URL 多带签名查询串，而响应体进网关时已按 §17 做凭证形态脱敏——
+    签名长串会被兜底规则抹成 ``***redacted***``，URL 随即不可用。快照又是转存取
+    URL 的唯一来源（``store_result`` 读 ``task.status_snapshot``），所以结果字段
+    必须用原始值，否则链路表现为 ``succeeded`` + 结果端点 410。
+
+    只回填 ``result_location`` 这一个叶子：错误信息里回显的凭证片段等仍在
+    ``json_body`` 上保持脱敏，§17 C2 的防护不受影响。
+    """
+    raw = result.response.raw_json_body if result.response else None
+    if not isinstance(raw, dict) or not isinstance(snapshot, dict) or not template.result_location:
+        return
+    found, value = try_extract(raw, template.result_location)
+    if not found or value is None:
+        return
+    from ..gateway.output import PathWriteSkipped, set_path_on_doc
+
+    try:
+        set_path_on_doc(snapshot, template.result_location, value)
+    except PathWriteSkipped:
+        pass
 
 
 async def _enter_poll_unrecognized(
@@ -898,7 +925,8 @@ async def store_result(ctx: HandlerContext) -> None:
 
     if not ok:
         detail = str(payload)
-        retryable = not detail.startswith("ssrf_rejected")
+        # 确定性失败不重试：SSRF 拒绝、结果大小超限（只有改配置才可能变）
+        retryable = not detail.startswith(("ssrf_rejected", "result too large"))
         if retryable and attempt < MAX_TRANSFER_ATTEMPTS:
             delay = backoff_seconds(attempt, base=5.0, cap=120.0)
             await _apply(
@@ -914,7 +942,9 @@ async def store_result(ctx: HandlerContext) -> None:
         )
         return
 
-    key = result_key(task.tenant, task.task_id, attempt=1, ext="bin")
+    key = result_key(
+        task.tenant, task.task_id, created_at=task.created_at, attempt=1, ext="bin"
+    )
     await ctx.result_store.put_bytes(key, payload, "application/octet-stream")  # type: ignore[arg-type]
     ok = await _apply(
         "set_result_ref", task.task_id,

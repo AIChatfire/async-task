@@ -90,7 +90,7 @@
 
 New API 侧计费映射（均在 New API，网关无感知）：提交→预扣；failed/timeout/cancelled→退款路径；succeeded→差额结算。
 
-**转存永久失败的上游成功任务**：报 `succeeded` + 结果不可用（envelope `degraded[]` 声明），平台承担上游成本——不伪造失败骗退款。原生表达：状态字段=上游原生成功终态，结果字段重写为网关结果端点 URL（转存永久失败时该 URL 返回 410 语义）——New API 按成功正常结算，用户取结果时得到明确不可用信号；M3 契约联调须验证 New API adaptor 对该形状不误判为 failed。转存独立重试、耗尽告警、支持重放转存。
+**转存永久失败的上游成功任务**：报 `succeeded` + 结果不可用（envelope `degraded[]` 声明），平台承担上游成本——不伪造失败骗退款。原生表达：状态字段=上游原生成功终态，**结果字段留空**（原设计是重写为"网关结果端点"并由该端点返回 410 语义；该中转端点已移除，理由见 `docs/IMPLEMENTATION.md` §3.14）——New API 按成功正常结算，调用方据"结果字段为空 + `degraded[]` 声明"得到明确不可用信号。转存独立重试、耗尽告警、支持重放转存。
 
 **响应形状保真（硬约束）**：base_url 模式下 New API 按上游原生 schema 解析 create/get 响应，面向 New API 的响应必须是上游原生形状；envelope 双字段（`raw_status`/`terminal`/`degraded[]`）仅面向网关自有调用方。
 
@@ -102,7 +102,9 @@ New API 侧计费映射（均在 New API，网关无感知）：提交→预扣�
 
 ### 4.4 机制与策略决策（引用式，详见正文）
 
-- **统一结果转存**：结果一律转存对象存储、回引用——详见 §12.2 result_policy。
+- **统一结果转存**：结果转存对象存储、回引用（`result_policy.mode: store`）——详见 §12.2 result_policy。
+  注：当前**全局默认取 `passthrough`**（先直链，见 `docs/IMPLEMENTATION.md` §3.13），
+  转存链路待对象存储验证后按模板逐个启用。
 - **无队列内优先级**：渠道级并发隔离 + 全局 FIFO——详见 §4.3、§15。
 - **状态来源主备**：`status_source: callback|poll` 主备不双轨——详见 §12.2。
 - **envelope 双字段 + degraded[]**：仅面向网关自有调用方——详见 §12.2、§16。
@@ -254,7 +256,7 @@ AI/人工起草 → 校验器 → Task-admin 预览（渲染请求样例 + 版�
 | cancel_path_template | create_path + `/{id}`（DELETE） |
 | 终态判定 | 默认 `terminal_success: [succeeded]`、`terminal_failure: [failed]`；上游 `expired` 统一映射进网关 `timeout`；特殊取值在模板中覆盖 |
 | status_source | 默认 `poll`；上游回调可靠则配 `callback`，轮询降为低频兜底，不做双轨并行；主源模式下兜底源的终态判定须与主源仲裁或经固定确认窗口才落库，防兜底误判永久锁死正确回调（§14 终态冲突仲裁） |
-| result_policy | 默认 `mode: store`（终态转存回引用，短 TTL 预签名 URL，TTL 策略可配）；上游永久直链可配 `passthrough`（须在 envelope `degraded[]` 声明依赖上游直链有效期）；`redirect` 按需；pipeline 插件位预留，第一版只实现 store/passthrough |
+| result_policy | `mode` 的**全局默认**由 `AG_RESULT_MODE_DEFAULT` 决定，当前取 `passthrough`（结果字段保留上游直链，须在 envelope `degraded[]` 声明依赖上游直链有效期；先直链的裁定见 `docs/IMPLEMENTATION.md` §3.13）；`store` = 终态转存回引用（短 TTL 预签名 URL，TTL 策略可配，**要求对象存储链路已验证**）；`redirect` 按需；pipeline 插件位预留，第一版只实现 store/passthrough |
 | callback 注入 | 约定参数 `callback_url` |
 | pool | 默认共享池；重轮询/灰度隔离渠道可指定专属池 |
 | 策略组 | 全局默认；New API 渠道侧可按渠道覆盖 |
@@ -277,7 +279,7 @@ AI/人工起草 → 校验器 → Task-admin 预览（渲染请求样例 + 版�
 - **终态后读路径**：终态且 store 模式时，响应结果字段重写为 `result_ref`（预签名 URL）指向对象存储；上游 URL 过期/任务归档后由 result_ref 服务；留存到期或删除后返回 410。
 - **状态输出契约**：终态输出单调不翻转、重复查询一致（§4.2），写入本查询面为硬约束。
 - **网关内部终态对外输出（硬规则）**：任务进入网关内部终态（timeout/dead/dead_awaiting_confirm）时，响应保持上游原生形状，但状态字段按模板终态映射**重写为上游原生的失败类终态取值**，失败原因字段按模板映射 error_code 为原生格式——形状保真且 New API 退款链路可触发；否则快照停在最后非终态、New API 永远读不到终态，退款不触发、状态输出契约落空。
-- **转存永久失败的原生表达**：状态字段=上游原生成功终态，结果字段重写为网关结果端点 URL（转存永久失败时该 URL 返回 410 语义）——保证 New API 正常结算、用户取结果时得到明确不可用信号；**M3 契约联调需验证 New API adaptor 对该形状不误判为 failed**。
+- **转存永久失败的原生表达**：状态字段=上游原生成功终态，**结果字段留空**（原为"重写为网关结果端点、由该端点返回 410"，该中转端点已移除，见 `docs/IMPLEMENTATION.md` §3.14）——保证 New API 正常结算，调用方据"字段为空 + `degraded[]` 声明"得到明确不可用信号；**M3 契约联调需验证 New API adaptor 对该形状不误判为 failed**。
 - **envelope（仅网关自有调用方）**：`raw_status` 透传上游原生状态（提交响应携带上游 create 原始响应）、`terminal` 三值（in_progress/succeeded/failed）、`degraded[]` 显式声明能力降级（如不支持的 cancel、passthrough 直链依赖、结果不可用）。
 
 ### 12.3 校验与预览
@@ -302,13 +304,18 @@ API文档/OpenAPI/curl ──► AI提取端点/ID位置/终态取值/结果字�
 
 ```yaml
 alias: volc-seedance
-base_url: https://ark.cn-beijing.volces.com/api/v3
-create_path: /contents/generations/tasks
+base_url: https://ark.cn-beijing.volces.com
+create_path: /api/v3/contents/generations/tasks
 result_location: $.content.video_url
 ```
 
 关键点：
 
+- **路径口径的切分**：`base_url` 收到站点根、把 `/api/v3` 并进 `create_path`。原因是 New API 的任务插件
+  （`volcengine-ark-3d` 等方舟系插件）在 JS 里**硬编码** `ctx.baseUrl + "/api/v3/contents/generations/tasks"`，
+  插件侧只能改渠道 base_url、改不了这段后缀；而网关按 alias 之后的剩余路径与 `create_path` 逐字比对归位。
+  这样切分后，「渠道 base_url 指向网关 → 零改插件复用」与「直连上游 URL 不变」同时成立
+  （见 `docs/newapi-task-plugin-integration.md` §2；回归测试 `test_ark_templates_align_with_newapi_plugin_path`）。
 - 真实上游 key 由 New API 渠道持有，随 Authorization 头透传；模板不含数据面凭证（原 `credential_ref` 行移除，接入故事改口径为"4 行配置 + 渠道持证"）。
 - `capabilities.upstream_idempotent: false` + `confirm_strategy: manual_only` 由**平台内置上游差异补丁**自动附加：声明"创建去重责任在网关，提交不确定时永不自动重发创建、转人工确认"。
 - 多 key 轮询/单 key 限流熔断切换为 New API 渠道侧原生能力，非网关职责。
@@ -475,7 +482,9 @@ dry-run（origin=dry_run）：确认后自动 cancel → 清理 → 归档；can
 
 ### 18.7 结果引用与出口收敛
 
-- 结果引用用短 TTL 预签名 URL（TTL 策略写进 `result_policy`）；或网关代理读 + 归属校验，代理读支持 **Range 透传**（大视频分段下载/断点续传）。
+- 结果引用用短 TTL 预签名 URL（TTL 策略写进 `result_policy`）——**当前实现即此**：结果在查询响应里**直给**，不经网关中转。
+  网关代理读（须 + 归属校验 + **Range 透传**，用于大视频分段下载/断点续传）为**未实现的备选**：将来若启用，
+  必须是带归属校验的独立形态，不得采用"匿名 + 内部主键做路径"的形态 —— 那正是被移除的 `/results/{task_id}`（见 `docs/IMPLEMENTATION.md` §3.14）。
 - worker 流量经固定 egress IP/出口代理，白名单在代理层再执行一次（平台层兜底）。
 
 ### 18.8 数据合规

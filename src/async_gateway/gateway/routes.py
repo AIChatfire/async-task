@@ -20,9 +20,8 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.responses import JSONResponse, Response
 
-from ..config import get_settings
 from ..db.audit import AuditEventType, AuditWriter
 from ..db.base import session_scope
 from ..db.dao import TaskDAO
@@ -156,6 +155,26 @@ async def async_dispatch(alias: str, request: Request, rest: str = "") -> Respon
     return await _handle_cancel(container, bus, auth, tv, match.upstream_id or "", request)
 
 
+async def _presigned_result_url(container: Container, task: AsyncTask, template) -> str | None:
+    """store 模式：把 ``result_ref`` 换成一个可直接取用的预签名 URL。
+
+    按 §12.2 首选**直给对象存储的预签名 URL**，不经过任何网关中转端点 ——
+    网关对外**只透传上游原生路径**（提交/查询/取消），不额外发明"结果路径"。
+    转存未完成、对象已过期或被删除时返回 ``None``，响应侧据此把结果字段留空。
+    """
+    if template.result_policy.mode is not ResultMode.STORE or task.result_ref is None:
+        return None
+    ttl = int(
+        template.result_policy.presign_ttl_seconds
+        or template.strategy.get("presign_ttl_seconds", container.settings.result_presign_ttl_seconds)
+        or container.settings.result_presign_ttl_seconds
+    )
+    try:
+        return await container.result_store.presign_get(task.result_ref, ttl)
+    except ObjectNotFound:
+        return None
+
+
 async def _handle_query(
     container: Container,
     bus,
@@ -194,12 +213,9 @@ async def _handle_query(
             except Exception:  # noqa: BLE001 - 上游抖动不能拖垮查询面
                 pass
 
-    native = build_native_query_response(
-        task,
-        template,
-        public_base_url=container.settings.callback_base_url,
-        result_available=task.result_ref is not None,
-    )
+    # store 模式下由 result_ref 直接换出对象存储的预签名 URL（§12.2 首选，不经网关中转）
+    result_url = await _presigned_result_url(container, task, template)
+    native = build_native_query_response(task, template, result_url=result_url)
     headers = response_headers(
         task, template, refresh_interval=min_refresh, result_available=task.result_ref is not None
     )
@@ -462,61 +478,15 @@ async def _apply_callback(container: Container, task_id: str, payload: Any, raw_
 # --------------------------------------------------------------------------------------
 # 结果端点（§18.7）
 # --------------------------------------------------------------------------------------
-@router.get("/results/{task_id}")
-async def get_result(task_id: str, request: Request) -> Response:
-    container = get_container()
-    settings = get_settings()
-    task = await _reload(task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="task not found")
-
-    # 归属纵深：调用方若带了渠道标识就必须自洽（不带也不拦，预签名 URL 本身即凭证）
-    channel = request.headers.get("x-ag-channel")
-    if channel and channel != task.channel:
-        raise HTTPException(status_code=404, detail="task not found")
-
-    tv = container.registry.get(task.template_alias, task.template_version)
-    if tv is None:  # pragma: no cover
-        raise HTTPException(status_code=404, detail="template unavailable")
-    template = tv.resolved
-
-    if task.result_degraded:
-        return JSONResponse(
-            status_code=410,
-            content={"detail": "result permanently unavailable (transfer failed); billed as succeeded"},
-        )
-    if task.result_ref is None:
-        if TaskStatus(task.status) is not TaskStatus.SUCCEEDED:
-            return JSONResponse(
-                status_code=409, content={"detail": f"task not succeeded: {task.status}"}
-            )
-        return JSONResponse(
-            status_code=202,
-            content={"detail": "result transfer in progress"},
-            headers={"Retry-After": "5"},
-        )
-    if template.result_policy.mode is ResultMode.PASSTHROUGH:
-        raise HTTPException(status_code=409, detail="passthrough mode: use the upstream URL from the query response")
-
-    ttl = int(
-        template.result_policy.presign_ttl_seconds
-        or template.strategy.get("presign_ttl_seconds", settings.result_presign_ttl_seconds)
-        or settings.result_presign_ttl_seconds
-    )
-    try:
-        url = await container.result_store.presign_get(task.result_ref, ttl)
-    except ObjectNotFound:
-        return JSONResponse(status_code=410, content={"detail": "result expired or deleted"})
-
-    await _audit(
-        AuditEventType.RESULT_READ,
-        actor="client",
-        subject_type="task",
-        subject_id=task_id,
-        refs={"result_ref": task.result_ref, "ttl": ttl},
-        detail="结果引用下发",
-    )
-    return RedirectResponse(url=url, status_code=302)
+# 结果获取**不走独立端点**：网关对外只透传上游原生路径（提交/查询/取消），
+# 结果由**查询路径的响应字段**给出（store 模式 = 对象存储预签名 URL，见 `_presigned_result_url`）。
+#
+# 原先的 `GET /results/{task_id}` 是这套体系里唯一的"固定端点"，同时踩了三条：
+#   1. 违背动态路由原则（routing.py：「不能靠固定端点表路由，要把剩余路径拿去和模板对照」）；
+#   2. 用内部主键 task_id 当能力 URL（该值还会经 X-AG-Task-Id 响应头外露 ⇒ 可被枚举取件）；
+#   3. 归属校验形同虚设（`x-ag-channel` 带了才校验，不带直接放行 ⇒ 匿名可读），
+#      与 §18.x「代理读须带归属校验」不符，也与插件 credentialless 回源相冲突。
+# 若将来确需网关代理读（Range 透传/隐藏桶），应做成**带归属校验的独立形态**再加回来。
 
 
 async def _audit(event_type: str, *, actor: str = "system", **kwargs: Any) -> None:

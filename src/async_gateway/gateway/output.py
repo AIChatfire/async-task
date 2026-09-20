@@ -32,12 +32,10 @@ from ..templates.derive import effective_failure_error_code, effective_failure_s
 from ..templates.expression import compile_expression
 from ..templates.schema import ResultMode, ResolvedTemplate
 
-#: 结果端点：稳定地址，内部再决定 302/202/409/410
-RESULT_ENDPOINT = "/results/{task_id}"
-
-
-def result_endpoint_url(public_base_url: str, task_id: str) -> str:
-    return public_base_url.rstrip("/") + RESULT_ENDPOINT.format(task_id=task_id)
+# 结果获取：**不经网关中转**（§12.2 首选）。store 模式下由 `result_ref` 直接换出对象存储的
+# 预签名 URL 写进响应体；因此这里既没有"结果端点"常量，也没有可枚举的结果路径。
+# 若将来确需网关代理读（Range 透传 / 隐藏桶），那必须是**带归属校验**的独立形态（§18.x），
+# 而不是现在这条匿名、用内部主键做路径的中转端点。
 
 
 class PathWriteSkipped(Exception):
@@ -166,10 +164,14 @@ def build_native_query_response(
     task: AsyncTask,
     template: ResolvedTemplate,
     *,
-    public_base_url: str,
-    result_available: bool,
+    result_url: str | None,
 ) -> Any:
-    """构造面向 New API 的查询响应：**上游原生形状** + 必要字段重写。"""
+    """构造面向 New API 的查询响应：**上游原生形状** + 必要字段重写。
+
+    ``result_url`` 由调用方**预先算好**（store 模式 = 对象存储的预签名 URL）：
+    转存尚未完成、对象已过期或被删除时传 ``None``，此时结果字段置空并带上
+    `_result_hint` —— "结果不可用"由**字段本身**表达，不再依赖某个网关端点返回 410。
+    """
     snapshot = native_snapshot(task)
     if not isinstance(snapshot, dict):
         # 快照不是对象（例如上游返回数组）→ 形状保真优先，不做重写
@@ -198,20 +200,16 @@ def build_native_query_response(
     is_success = status is TaskStatus.SUCCEEDED
     if is_success:
         if template.result_policy.mode is ResultMode.STORE:
+            # store：结果字段 = 对象存储的预签名 URL（直给，不经网关中转）
             try:
-                set_path_on_doc(
-                    snapshot,
-                    template.result_location,
-                    result_endpoint_url(public_base_url, task.task_id),
-                )
+                set_path_on_doc(snapshot, template.result_location, result_url)
             except PathWriteSkipped:
                 pass
-            if not result_available:
-                # 转存永久失败：状态仍是原生成功终态，结果字段指向网关端点（取时得到 410）
+            if result_url is None:
+                # 转存未完成或永久失败：**不伪造失败** —— 状态保持上游原生成功终态，
+                # 结果字段留空；envelope 的 degraded[] 已声明 result_pending/unavailable
                 snapshot.setdefault("_result_hint", "unavailable_or_pending")
-        else:
-            # passthrough：保留上游直链（degraded[] 里已声明有效期依赖）
-            pass
+        # passthrough：保留上游直链（degraded[] 已声明有效期依赖），不动结果字段
     elif is_internal_terminal(status) or status is TaskStatus.CANCELLED:
         error_field = template.terminal.error_field
         if error_field:
@@ -220,12 +218,9 @@ def build_native_query_response(
             except PathWriteSkipped:
                 pass
         if template.result_policy.mode is ResultMode.STORE:
+            # 终态无产物：结果字段清空（原先指向网关中转端点，该端点已取消）
             try:
-                set_path_on_doc(
-                    snapshot,
-                    template.result_location,
-                    result_endpoint_url(public_base_url, task.task_id),
-                )
+                set_path_on_doc(snapshot, template.result_location, None)
             except PathWriteSkipped:
                 pass
     return snapshot

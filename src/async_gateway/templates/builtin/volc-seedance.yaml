@@ -2,9 +2,15 @@
 # 真实上游 key 由 New API 渠道持有，随 Authorization 头透传；模板不含数据面凭证。
 # capabilities（upstream_idempotent:false / confirm_strategy:manual_only）由
 # 平台差异补丁 patches/volc-seedance.yaml 自动附加，此处不写。
+#
+# 路径口径：base_url 收到站点根、把 /api/v3 并进 create_path。
+# 方舟系的 New API 任务插件（volcengine-ark-3d 等）在 JS 里**硬编码**
+# `ctx.baseUrl + "/api/v3/contents/generations/tasks"`，而网关按 alias 之后的剩余路径与
+# create_path **逐字**比对归位。把 /api/v3 放进 create_path 才能让"渠道 base_url 指向
+# 网关"时零改插件复用（详见 docs/newapi-task-plugin-integration.md §2）。
 alias: volc-seedance
-base_url: https://ark.cn-beijing.volces.com/api/v3
-create_path: /contents/generations/tasks
+base_url: https://ark.cn-beijing.volces.com
+create_path: /api/v3/contents/generations/tasks
 result_location: $.content.video_url
 
 normalize:

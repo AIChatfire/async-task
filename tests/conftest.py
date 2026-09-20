@@ -17,6 +17,10 @@ os.environ.update(
         "AG_APP_ENV": "test",
         "AG_DATABASE_URL": f"sqlite+aiosqlite:///{_TMP}/test.db",
         "AG_RESULT_STORE_MODE": "memory",
+        # 注意与上一行的区别：这一项是"结果**策略**模式"（store/passthrough）。
+        # 既有用例假定"成功即转存"（store），故测试环境显式指定；
+        # "默认取配置"这条逻辑另有专门用例（test_templates.py）覆盖。
+        "AG_RESULT_MODE_DEFAULT": "store",
         "AG_QUEUE_DRIVER": "memory",
         "AG_SSRF_ALLOW_HOSTS": '["localhost","127.0.0.1","gw.test"]',
         "AG_SSRF_PIN_DNS": "false",
@@ -84,6 +88,10 @@ class FakeUpstream:
         self.poll_status_override: str | None = None
         self.result_bytes = b"FAKE-RESULT-BYTES"
         self.result_status = 200
+        #: 结果拉取校验的签名期望值。真机上游的结果 URL 多为预签名（TOS 等），
+        #: 签名被篡改或抹除即 403 —— 设了它，MockTransport 才具备"签名必须原样送达"
+        #: 的区分度（默认 None = 不校验，只看路径）。
+        self.result_expected_signature: str | None = None
         self.request_log: list[tuple[str, str]] = []
 
     # ---- 剧本控制 ----
@@ -168,6 +176,9 @@ class FakeUpstream:
 
         if request.method == "GET" and path.startswith("/files/"):
             self.result_fetches += 1
+            if self.result_expected_signature is not None:
+                if request.url.params.get("X-Tos-Signature") != self.result_expected_signature:
+                    return httpx.Response(403, content=b"signature mismatch")
             if self.result_status != 200:
                 return httpx.Response(self.result_status, content=b"nope")
             return httpx.Response(200, content=self.result_bytes)

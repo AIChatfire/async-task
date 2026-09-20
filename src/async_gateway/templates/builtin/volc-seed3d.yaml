@@ -1,0 +1,18 @@
+# 第二个接入的上游：图生 3D（doubao-seed3d），与 Seedance 同基址。
+#
+# 极简模式（4 行）+ 渠道持证；平台差异补丁按 host 命中
+# （patches/volc-seedance.yaml 的 match_hosts 含 ark.cn-beijing.volces.com），此处不写。
+#
+# 路径口径：base_url 收敛到站点根、把 /api/v3 并进 create_path。这样两件事同时成立：
+#   1. 直连上游：base_url + create_path = https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks
+#   2. 经 New API：渠道 base_url 配成 {网关}/async/volc-seed3d，
+#      new-api 任务插件（volcengine-ark-3d）硬编码拼 "/api/v3/contents/generations/tasks"，
+#      拼出的剩余路径与 create_path 逐字相同 → 网关 routing 归位为 create（见 tests/test_volc_seed3d.py）
+#
+# result_location 是**实测绘出的**（2026-09-20 真机）：直连方舟时结果在 content.file_url。
+# New API 侧插件 README 记的是 content.url —— 那是其 BFF 归一化后的形状，照抄会导致
+# "任务 succeeded 但结果取不到"（转存永久失败 + 结果端点 410）。
+alias: volc-seed3d
+base_url: https://ark.cn-beijing.volces.com
+create_path: /api/v3/contents/generations/tasks
+result_location: $.content.file_url

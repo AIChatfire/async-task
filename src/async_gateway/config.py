@@ -57,6 +57,21 @@ class Settings(BaseSettings):
     result_retention_days: int = 30
     result_presign_ttl_seconds: int = 900
     transfer_max_inline_bytes: int = 1_048_576
+    #: 结果**文件**单次拉取上限（转存用）。
+    #:
+    #: 与"上游 API 响应体上限"（``UpstreamClient.max_response_bytes``，4 MiB）是**两件事**：
+    #: 前者是 JSON 状态响应，后者是产物本体。实测火山 3D 产物用 obj + 高细分即 41 MB，
+    #: 视频产物量级更高——沿用 4 MiB 会让转存在大小检查处确定性失败
+    #: （表现为 ``succeeded`` + ``result_degraded=['transfer_failed']`` + 结果端点 410）。
+    result_max_bytes: int = 268_435_456
+    #: 结果策略模式的**全局默认**（模板未显式声明 ``result_policy.mode`` 时生效）。
+    #:
+    #: 默认 ``passthrough``（不转存、直接给上游直链）的理由：转存链路依赖对象存储
+    #: （MinIO/S3）与"存储地址对调用方可达"这两件在本环境**尚未验证**的事，且上游产物
+    #: 常见几十 MB；先直链可以让链路一次跑通，待对象存储验完再按模板/渠道逐个切回 ``store``。
+    #: 代价：结果链接依赖上游有效期（火山 TOS 预签名 24h），且上游直链会暴露给调用方
+    #: （envelope ``degraded[]`` 会声明该依赖）。
+    result_mode_default: Literal["store", "passthrough", "redirect"] = "passthrough"
     submit_confirm_window_seconds: int = 120
 
     # 背压：受理速率配额 与 上游并发槽 分离计数（§4.3）
