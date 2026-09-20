@@ -136,6 +136,10 @@ jobs:
           TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           set -euo pipefail
+          # annotated tag 需要 committer 身份，而 runner 上没有全局 git 配置
+          # （漏了这两行会得到 "Committer identity unknown" / exit 128）
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             echo "!! $TAG 已存在（并发运行或人工已打）—— 报错退出，避免版本号重复"
             exit 1
