@@ -43,11 +43,15 @@ class Settings(BaseSettings):
     queue_max_depth: int = 100_000
 
     # ---- 对象存储 ----
-    s3_endpoint: str = "http://localhost:9000"
-    s3_access_key: str = "minioadmin"
-    s3_secret_key: str = "minioadmin"
-    s3_bucket: str = "async-gateway"
-    s3_secure: bool = False
+    # 默认**对接外部对象存储**（生产口径）。本地联调由 docker-compose 的
+    # `${AG_S3_*:-...}` 兜底覆盖成本地 MinIO（见 docker-compose.yml）。
+    # 凭据**故意不给默认值**：写 `minioadmin` 这类假默认，只会在配置遗漏时静默连上错误的对象存储；
+    # 留空则第一次使用就明确失败 —— 与"不自动建桶"同一取向（部署错误要立刻暴露）。
+    s3_endpoint: str = "https://oss.s3ai.cn"
+    s3_access_key: str = ""
+    s3_secret_key: str = ""
+    s3_bucket: str = "cdn"
+    s3_secure: bool = True
     result_store_mode: Literal["object", "memory"] = "object"
 
     # ---- 策略组默认值 ----

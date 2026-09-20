@@ -32,11 +32,22 @@
 > 唯一需要外部裁决的语义缺口：worker 之后的轮询也需要这个 key，而"不落盘"与"另一个进程里调用上游"
 > 字面上冲突。落地裁定见 `docs/IMPLEMENTATION.md` §3.2。
 
+## 配置
+
+所有配置项以 `AG_` 前缀注入（嵌套用双下划线）。**权威清单**是 [`.env.example`](.env.example)：
+它与代码里的 `Settings` **逐字段对齐**（有门禁 `tests/test_env_contract.py` 守着双向一致），
+文件顶部列出**生产部署必改项**。`docker-compose.yml` 会注入 `.env`（`required: false`），
+所以照模板配的项在容器路径上也真的生效。
+
+```bash
+cp .env.example .env    # 然后按顶部清单逐条改；切勿提交 .env
+```
+
 ## 快速开始
 
 ```bash
 make install        # pip install -e ".[dev]"
-make test           # 199 项测试（SQLite + 内存 broker + MockTransport 假上游，无需 Redis）
+make test           # 209 项测试（SQLite + 内存 broker + MockTransport 假上游，无需 Redis）
 make test-all       # 追加 Redis 真机用例（Lua 原子性 / Streams 消费组 / AIMD 直方图）
 
 make gateway        # http://localhost:8000  （/docs 在非 prod 环境开放）

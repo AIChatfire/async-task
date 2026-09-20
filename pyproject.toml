@@ -33,6 +33,8 @@ dev = [
     "taskiq>=0.11",
     "taskiq-redis>=1.0",
     "logfire>=0.50",
+    # tests/test_env_contract.py 用 yaml 解析 docker-compose.yml（显式声明，别依赖间接包）
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]

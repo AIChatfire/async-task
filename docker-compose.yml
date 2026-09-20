@@ -1,22 +1,31 @@
 # 开发联调：起全部依赖与进程（生产为 K8s，见 docs/IMPLEMENTATION.md §部署）
 name: async-gateway
 
+# 全部可配置项都由 .env 注入（权威清单见 .env.example）；这里只列**本地联调必须指向
+# compose 内服务**的那几项，并写成 ${AG_XXX:-默认} 形式：不配 .env 时行为与以前完全一致，
+# 配了 .env 则该值生效。
 x-app-env: &app-env
-  AG_APP_ENV: dev
-  AG_DATABASE_URL: postgresql+asyncpg://async_gateway:async_gateway@postgres:5432/async_gateway
-  AG_REDIS_URL: redis://redis:6379/0
-  AG_S3_ENDPOINT: http://minio:9000
-  AG_S3_ACCESS_KEY: minioadmin
-  AG_S3_SECRET_KEY: minioadmin
-  AG_S3_BUCKET: async-gateway
-  AG_CALLBACK_BASE_URL: http://gateway-api:8000
-  AG_CALLBACK_HMAC_KEYS: '{"k1":"dev-only-secret"}'
-  AG_ADMIN_TOKEN: dev-admin-token
+  AG_APP_ENV: ${AG_APP_ENV:-dev}
+  AG_DATABASE_URL: ${AG_DATABASE_URL:-postgresql+asyncpg://async_gateway:async_gateway@postgres:5432/async_gateway}
+  AG_REDIS_URL: ${AG_REDIS_URL:-redis://redis:6379/0}
+  AG_S3_ENDPOINT: ${AG_S3_ENDPOINT:-http://minio:9000}
+  AG_S3_ACCESS_KEY: ${AG_S3_ACCESS_KEY:-minioadmin}
+  AG_S3_SECRET_KEY: ${AG_S3_SECRET_KEY:-minioadmin}
+  AG_S3_BUCKET: ${AG_S3_BUCKET:-async-gateway}
+  AG_CALLBACK_BASE_URL: ${AG_CALLBACK_BASE_URL:-http://gateway-api:8000}
+  AG_CALLBACK_HMAC_KEYS: '${AG_CALLBACK_HMAC_KEYS:-{"k1":"dev-only-secret"}}'
+  AG_ADMIN_TOKEN: ${AG_ADMIN_TOKEN:-dev-admin-token}
 
 x-app-build: &app-build
   build:
     context: .
     dockerfile: Dockerfile
+  # .env 里声明的**其余配置项**（轮询间隔、背压、SSRF 白名单、结果策略……）由此注入。
+  # 少了这一段，照着 .env.example 配出来的项在容器里全部不生效，且不报错、不告警。
+  # required: false ⇒ 没有 .env 时照旧用上面的默认值，不报错。
+  env_file:
+    - path: .env
+      required: false
   volumes:
     - ./src:/app/src:ro
   depends_on:

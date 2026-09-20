@@ -266,6 +266,28 @@ New API 的任务插件是**单文件 JS**，上游路径是**硬编码**的
 若将来确有"网关代理读"需求（Range 透传 / 隐藏桶），须以**带归属校验**的独立形态重新引入
 （§12.2 / §485 的备选），不得回到匿名 + 内部主键的形态。
 
+### 3.15 env 契约：模板 / 代码 / 编排三向对齐（2026-09-20）
+
+| 方向 | 发现 | 处置 |
+|---|---|---|
+| **代码读、模板没登记** | `Settings` 共 75 个字段，`.env.example` 只登记 44 个 ⇒ **31 个开关运维根本不知道存在**（含 `AG_QUEUE_DRIVER`、`AG_RESULT_STORE_MODE`、`AG_SSRF_DENY_PRIVATE`、`AG_MIN_REFRESH_INTERVAL`、`AG_CANARY_*` 等），照模板配永远用默认值 | 模板补齐为**逐字段对齐的权威清单**，并在顶部列出「生产部署必改项」 |
+| **模板有、编排不注入** | `docker-compose.yml` 的 `x-app-env` 只显式列 10 项、且**没有 `env_file`** ⇒ 其余 **34 项**照模板配了在容器里**全部不生效**（不报错、不告警） | 给 `x-app-build` 加 `env_file: [{path: .env, required: false}]`（app 服务经锚点继承）；那 10 项改成 `${AG_XXX:-默认}` —— `environment` 优先级**高于** `env_file`，不这么写 `.env` 覆盖不了 |
+| **形态陷阱** | `KEY=  # 注释` 会被解析器把注释整段当成值（fail-open；空值语义静默失效） | 门禁静态扫该形态；模板约定「留空就写 `KEY=`，要注释就写 `KEY=值  # 注释`」 |
+| **空串顶默认值** | 模板里留空的项，若代码默认非 `None`，显式空串会把默认值顶掉 | 门禁断言「模板留空项 ⇒ 代码默认必须是 `None`」 |
+
+门禁：`tests/test_env_contract.py`（5 项）—— 双向键一致 + 空值形态 + 空值回落 + compose 注入 + compose 可覆盖。
+**回放验证**：用上一版模板跑同一判据 ⇒ 漏登记 31 个（证明门禁不是空转）。
+另把 `pyyaml` 显式加进 dev 依赖（门禁要解析 compose，别依赖间接包）。
+
+**未验证**：本机**无 Docker**，`docker compose config` 跑不了 ⇒ 容器路径只做了**静态**断言
+（证明"声明的键会被注入"），**没有**做运行态对差（`docker inspect` 实注入 env）。生产不以这份
+compose 部署（生产为 K8s）。
+
+**附带（同日）**：`AG_S3_ENDPOINT` / `AG_S3_BUCKET` / `AG_S3_SECURE` 的**代码默认值**改为外部对象存储
+（`https://oss.s3ai.cn` / `cdn` / `true`），取消"模板给生产值、代码默认给本机值"的两套口径；
+**凭据默认值改为空串** —— 不留 `minioadmin` 这类假默认：配置遗漏时要**立刻失败**，而不是静默连上
+错误的对象存储（与"不自动建桶"同一取向）。本地联调仍由 compose 的 `${AG_S3_*:-…}` 兜底成本地 MinIO。
+
 冒烟脚本：`scripts/smoke_workers.py`（起 scheduler 2 tick → inspector 1 tick → worker 消费并 ACK 一条消息，
 走真实 Redis Streams 消费组）。实测输出：`SMOKE OK`。
 
