@@ -1,0 +1,178 @@
+# push 到 main 即自增 patch 发版 + 构建并推送 GHCR 镜像；人工打 tag 则发该 tag（不自增）。
+#
+# 设计要点（每条都有踩坑来源，别随手改）：
+#   * 镜像构建与打 tag 必须在**同一个 workflow** 内：GITHUB_TOKEN 推送的 tag 不会触发其他 workflow，
+#     拆成两个会留下"有 tag、没镜像"的**静默**半成品；
+#   * checkout 一律钉 `github.sha`（分支 push 时 `github.ref` 是会移动的指针 —— 等构建跑完，
+#     它可能已指向更新的提交，于是 tag 打在了不是本次触发发布的那个提交上）；
+#   * **打 tag 放在推镜像之后**：构建失败不留下"有 tag、没镜像"；
+#   * GHCR 镜像名**必须全小写**（仓库名含大写时要转换，否则 push 403/404）；
+#   * Release 创建做**幂等**（重跑同一 tag 不再变红）；
+#   * 逃生阀的字面量**不得出现在任何要发版的 commit message 里**（含"给它写说明"的那次提交）。
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v[0-9]*.[0-9]*.[0-9]*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '补发一个已存在的 tag（留空 = 按 main 自增 patch）'
+        required: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write    # 建 tag 与 Release
+  packages: write    # 推 GHCR
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    # 自我触发兜底（将来换 PAT 才用得上）；workflow_dispatch 无 head_commit，故未在此处判逃生阀
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    outputs:
+      mode: ${{ steps.ver.outputs.mode }}
+      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
+      commit: ${{ steps.ver.outputs.commit }}
+      sha7: ${{ steps.ver.outputs.sha7 }}
+      image: ${{ steps.ver.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.sha }}
+          fetch-depth: 0        # 缺了它读不到历史 tag，版本号会永远从 v0.0.1 起
+      - id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            # GHCR 镜像名必须全小写。用 tr 而不是 ${VAR,,} —— 后者是 bash 4+ 特性，
+            # 本地 bash 3.2 跑不了（runner 是 bash 5 能用，但少一个隐式版本依赖更稳）
+            echo "image=ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+            echo "commit=$(git rev-parse HEAD)"
+            echo "sha7=$(git rev-parse --short=7 HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+          # 逃生阀：在第一个 job 内判定并输出 mode=skip，而不是用 job 级 if
+          # （job 被 skip 会级联 skip 下游；这里下游按 mode 决定跑不跑）
+          MSG=$(git log -1 --pretty=%B)
+          if printf '%s' "$MSG" | grep -qF '[skip release]'; then
+            echo "mode=skip" >> "$GITHUB_OUTPUT"
+            echo "提交信息命中跳过标记 —— 本次不发版（不产 tag / 镜像 / Release）"
+            exit 0
+          fi
+
+          INPUT_TAG="${{ inputs.tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            MODE=tag; TAG="$INPUT_TAG"
+          elif [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            MODE=tag; TAG="${GITHUB_REF#refs/tags/}"
+          else
+            MODE=auto
+          fi
+
+          if [ "$MODE" = auto ]; then
+            LATEST=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
+            LATEST=${LATEST:-v0.0.0}          # 冷启动：零 tag 时从 v0.0.0 起算
+            CORE="${LATEST#v}"
+            MAJOR="${CORE%%.*}"
+            REST="${CORE#*.}"
+            MINOR="${REST%%.*}"
+            PATCH="${REST#*.}"
+            PATCH="${PATCH%%[-+]*}"           # 剥掉 -rc.1 这类后缀，否则算术报错
+            TAG="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+            echo "auto：上一版 $LATEST → 本版 $TAG"
+          fi
+
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"   # 镜像 tag 不带 v 前缀
+
+  build-and-push:
+    needs: resolve
+    if: ${{ needs.resolve.outputs.mode != 'skip' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+      - name: 登录 GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: 构建并推送（版本 / latest / sha- 三 tag 同一镜像）
+        env:
+          IMAGE: ${{ needs.resolve.outputs.image }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          SHA7: ${{ needs.resolve.outputs.sha7 }}
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg APP_VERSION="$VERSION" \
+            -t "$IMAGE:$VERSION" \
+            -t "$IMAGE:latest" \
+            -t "$IMAGE:sha-$SHA7" \
+            .
+          docker push "$IMAGE:$VERSION"
+          docker push "$IMAGE:latest"
+          docker push "$IMAGE:sha-$SHA7"
+
+  release:
+    needs: [resolve, build-and-push]
+    if: ${{ needs.resolve.outputs.mode != 'skip' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          fetch-depth: 0
+      - name: 打版本 tag（仅 auto 模式；人工 tag 模式用已存在的那个）
+        if: ${{ needs.resolve.outputs.mode == 'auto' }}
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "!! $TAG 已存在（并发运行或人工已打）—— 报错退出，避免版本号重复"
+            exit 1
+          fi
+          git tag -a "$TAG" -m "release $TAG"
+          git push origin "refs/tags/$TAG"
+      - name: 建 Release（幂等）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          IMAGE: ${{ needs.resolve.outputs.image }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          SHA7: ${{ needs.resolve.outputs.sha7 }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG 已存在 —— 跳过（幂等：重跑同一 tag 不变红）"
+            exit 0
+          fi
+          if PREV=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "${TAG}^" 2>/dev/null); then
+            RANGE="${PREV}..${TAG}"
+          else
+            RANGE="${TAG}"
+          fi
+          NOTES=/tmp/notes.md
+          {
+            echo "容器镜像（三个 tag 指向同一镜像）："
+            echo
+            echo '```'
+            echo "$IMAGE:$VERSION"
+            echo "$IMAGE:latest"
+            echo "$IMAGE:sha-$SHA7"
+            echo '```'
+            echo
+            echo "变更："
+            echo
+            git log "$RANGE" --no-merges --max-count=50 --pretty='- %s (%h)'
+          } > "$NOTES"
+          gh release create "$TAG" --title "$TAG" --notes-file "$NOTES"

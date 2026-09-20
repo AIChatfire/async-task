@@ -1,5 +1,10 @@
-# 异步网关镜像（⚠️ 本机无 docker CLI，本文件未被构建/运行验证过）
+# 异步网关镜像（⚠️ 本机无 docker CLI，本文件未被本地构建验证；构建由 CI 承担）
 FROM python:3.12-slim
+
+# 镜像版本自证：CI 传 `--build-arg APP_VERSION=<版本>`（镜像 tag **无 v 前缀**）。
+# 它不是应用配置项（Settings 不读），只为 `docker inspect` 时能核对镜像版本。
+ARG APP_VERSION=dev
+ENV AG_IMAGE_VERSION=$APP_VERSION
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
