@@ -1,0 +1,271 @@
+"""状态输出契约（§4.2 / §12.2）。
+
+网关不参与计费；它对计费的全部责任收敛为**状态输出契约**：
+
+1. **真实**：输出状态反映上游真实状态，不伪造成功、不伪造失败。
+2. **单调收敛不翻转**：终态只允许一次迁移（条件更新保证），输出侧只读。
+3. **重复查询一致**：终态后固定读 ``result_ref``，不再打上游。
+4. **内部终态有原生输出路径**：``timeout/dead/dead_awaiting_confirm`` 是网关内部终态，
+   上游原生枚举没有 → 响应**保持上游原生形状**，但状态字段按模板映射重写为
+   **上游原生失败类终态取值**，失败原因字段按模板映射 error_code 为原生格式。
+   否则快照停在最后非终态，New API 永远读不到终态、退款不触发。
+
+另外两条容易被忽略的硬规则：
+
+* **响应形状保真**：面向 New API 的 create/get 响应必须是上游原生形状（envelope 只给
+  网关自有调用方）。所以这里做的是"在原生形状上就地重写字段"，而不是包一层。
+* **转存永久失败的上游成功任务报 succeeded + 结果不可用**：状态字段 = 上游原生成功终态，
+  结果字段重写为网关结果端点 URL（该 URL 返回 410 语义）——New API 按成功正常结算，
+  用户取结果时得到明确不可用信号；平台承担上游成本，不伪造失败骗退款。
+"""
+
+from __future__ import annotations
+
+import copy
+from dataclasses import dataclass
+from typing import Any
+
+from ..db.models import AsyncTask
+from ..domain.enums import OutputTerminal, TaskStatus
+from ..domain.state_machine import is_internal_terminal, output_terminal
+from ..templates.derive import effective_failure_error_code, effective_failure_status
+from ..templates.expression import compile_expression
+from ..templates.schema import ResultMode, ResolvedTemplate
+
+#: 结果端点：稳定地址，内部再决定 302/202/409/410
+RESULT_ENDPOINT = "/results/{task_id}"
+
+
+def result_endpoint_url(public_base_url: str, task_id: str) -> str:
+    return public_base_url.rstrip("/") + RESULT_ENDPOINT.format(task_id=task_id)
+
+
+class PathWriteSkipped(Exception):
+    """快照形状不支持就地重写（例如快照不是对象）。"""
+
+
+def set_path_on_doc(doc: dict[str, Any], spec: str, value: Any) -> None:
+    """把取值写到表达式指明的路径上（就地重写原生形状用）。
+
+    只支持在既有对象上写**键**；路径含下标或中间层不存在时按"新建 dict"处理，
+    无法新建（父节点是标量/数组元素）则抛 :class:`PathWriteSkipped`。
+    """
+    path = compile_expression(spec)
+    if not path.steps:
+        raise PathWriteSkipped("空路径")
+    node: Any = doc
+    for step in path.steps[:-1]:
+        if step.kind != "key":
+            raise PathWriteSkipped(f"路径含下标，无法安全重写：{spec}")
+        child = node.get(step.value)
+        if not isinstance(child, dict):
+            child = {}
+            node[step.value] = child
+        node = child
+    last = path.steps[-1]
+    if last.kind != "key":
+        raise PathWriteSkipped(f"路径末段是下标，无法安全重写：{spec}")
+    node[last.value] = value
+
+
+@dataclass(frozen=True, slots=True)
+class DegradedNotice:
+    code: str
+    detail: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {"code": self.code, "detail": self.detail}
+
+
+def degraded_notices(task: AsyncTask, template: ResolvedTemplate, *, result_available: bool) -> list[DegradedNotice]:
+    """``degraded[]``：显式声明能力降级，不静默承诺（§4.2 / 验收 7）。"""
+    notices: list[DegradedNotice] = []
+    attrs = task.attributes or {}
+    if attrs.get("cancel_degraded"):
+        notices.append(
+            DegradedNotice("cancel_requested", "上游不支持取消，已降级为 cancel_requested 标记")
+        )
+    if template.result_policy.mode is ResultMode.PASSTHROUGH:
+        notices.append(
+            DegradedNotice("passthrough_result", "结果直链依赖上游有效期，未转存")
+        )
+    if task.result_degraded:
+        notices.append(DegradedNotice("result_unavailable", "结果转存永久失败，结果端点返回 410"))
+    if TaskStatus(task.status) is TaskStatus.POLL_UNRECOGNIZED:
+        notices.append(
+            DegradedNotice("poll_unrecognized", "轮询响应判不出终态，已按不可判定处理并继续重试")
+        )
+    if is_internal_terminal(task.status):
+        notices.append(
+            DegradedNotice(
+                "gateway_internal_terminal",
+                f"{task.status} 为网关内部终态，已按模板映射重写为上游原生失败类取值",
+            )
+        )
+    if not template.capabilities.upstream_idempotent:
+        notices.append(
+            DegradedNotice("upstream_idempotent_false", "上游创建非幂等，创建去重由网关承担")
+        )
+    if template.status_source.value == "callback" and not template.capabilities.callback:
+        notices.append(DegradedNotice("callback_unavailable", "上游无可靠回调，已降级为轮询"))
+    if not result_available and TaskStatus(task.status) is TaskStatus.SUCCEEDED:
+        notices.append(DegradedNotice("result_pending", "结果转存进行中，稍后重试结果端点"))
+    return notices
+
+
+def envelope(task: AsyncTask, template: ResolvedTemplate, *, result_available: bool = False) -> dict[str, Any]:
+    """envelope：**仅面向网关自有调用方**（New API 侧不用）。"""
+    return {
+        "task_id": task.task_id,
+        "alias": task.template_alias,
+        "template_version": task.template_version,
+        "raw_status": task.raw_status,
+        "terminal": output_terminal(task.status).value,
+        "internal_status": task.status,
+        "attempts": task.attempts,
+        "error_code": task.error_code,
+        "next_poll_at": task.next_poll_at.isoformat() if task.next_poll_at else None,
+        "deadline_at": task.deadline_at.isoformat() if task.deadline_at else None,
+        "degraded": [n.as_dict() for n in degraded_notices(task, template, result_available=result_available)],
+    }
+
+
+def native_snapshot(task: AsyncTask) -> Any:
+    if task.status_snapshot is not None:
+        return copy.deepcopy(task.status_snapshot)
+    return {}
+
+
+def _effective_status_value(task: AsyncTask, template: ResolvedTemplate) -> tuple[str | None, bool]:
+    """返回 ``(要写入的原生状态值, 是否需要重写)``。
+
+    只有"网关内部终态 / 取消"才**必须**重写；成功态尽量沿用上游原生取值。
+    """
+    status = TaskStatus(task.status)
+    native = task.raw_status
+    success_values = set(template.terminal.success)
+    failure_values = set(template.terminal.failure) | set(template.terminal.expired)
+
+    if status is TaskStatus.SUCCEEDED:
+        if native in success_values:
+            return native, False
+        return (template.terminal.success or ["succeeded"])[0], True
+    if status is TaskStatus.CANCELLED:
+        if native in failure_values:
+            return native, False
+        # 取消必须让计费侧读到失败类终态，否则会被当成在途任务
+        return effective_failure_status(template), True
+    if is_internal_terminal(status):
+        if native in failure_values and status is TaskStatus.TIMEOUT and native in template.terminal.expired:
+            return native, False
+        return effective_failure_status(template), True
+    return native, False
+
+
+def build_native_query_response(
+    task: AsyncTask,
+    template: ResolvedTemplate,
+    *,
+    public_base_url: str,
+    result_available: bool,
+) -> Any:
+    """构造面向 New API 的查询响应：**上游原生形状** + 必要字段重写。"""
+    snapshot = native_snapshot(task)
+    if not isinstance(snapshot, dict):
+        # 快照不是对象（例如上游返回数组）→ 形状保真优先，不做重写
+        return snapshot
+
+    status_value, needs_rewrite = _effective_status_value(task, template)
+    if status_value is not None:
+        # 两件事都可能要求我们写状态字段：
+        #   1) 内部终态必须重写为上游原生失败类取值（§12.2 硬规则）；
+        #   2) 快照里压根没有状态字段（例如 create 之后还没轮询、或首次查询把空快照
+        #      直接回给调用方）—— 一个没有 status 的原生形状对 New API 毫无用处。
+        present = False
+        try:
+            from ..templates.expression import try_extract as _try
+
+            present, _ = _try(snapshot, template.status_field)
+        except Exception:  # noqa: BLE001 - 形状异常时按"不存在"处理
+            present = False
+        if needs_rewrite or not present:
+            try:
+                set_path_on_doc(snapshot, template.status_field, status_value)
+            except PathWriteSkipped:
+                pass
+
+    status = TaskStatus(task.status)
+    is_success = status is TaskStatus.SUCCEEDED
+    if is_success:
+        if template.result_policy.mode is ResultMode.STORE:
+            try:
+                set_path_on_doc(
+                    snapshot,
+                    template.result_location,
+                    result_endpoint_url(public_base_url, task.task_id),
+                )
+            except PathWriteSkipped:
+                pass
+            if not result_available:
+                # 转存永久失败：状态仍是原生成功终态，结果字段指向网关端点（取时得到 410）
+                snapshot.setdefault("_result_hint", "unavailable_or_pending")
+        else:
+            # passthrough：保留上游直链（degraded[] 里已声明有效期依赖）
+            pass
+    elif is_internal_terminal(status) or status is TaskStatus.CANCELLED:
+        error_field = template.terminal.error_field
+        if error_field:
+            try:
+                set_path_on_doc(snapshot, error_field, effective_failure_error_code(template))
+            except PathWriteSkipped:
+                pass
+        if template.result_policy.mode is ResultMode.STORE:
+            try:
+                set_path_on_doc(
+                    snapshot,
+                    template.result_location,
+                    result_endpoint_url(public_base_url, task.task_id),
+                )
+            except PathWriteSkipped:
+                pass
+    return snapshot
+
+
+def body_field_name(template: ResolvedTemplate) -> str | None:
+    """结果字段名（用于判断客户端能否读到结果）。"""
+    steps = compile_expression(template.result_location).steps
+    if steps and steps[-1].kind == "key":
+        return str(steps[-1].value)
+    return None
+
+
+def response_headers(
+    task: AsyncTask,
+    template: ResolvedTemplate,
+    *,
+    refresh_interval: float,
+    result_available: bool,
+) -> dict[str, str]:
+    """查询面行为头：快照优先 → 引导客户端降频 + 终态不刷新。"""
+    headers: dict[str, str] = {
+        "X-AG-Task-Id": task.task_id,
+        "X-AG-Internal-Status": task.status,
+        "X-AG-Envelope": "1",
+    }
+    status = TaskStatus(task.status)
+    if status in (TaskStatus.SUCCEEDED, TaskStatus.POLL_UNRECOGNIZED) or is_internal_terminal(status):
+        # 终态后读 result_ref，不再打上游
+        headers["X-AG-Snapshot"] = "terminal"
+        return headers
+    headers["X-AG-Snapshot"] = "cached"
+    headers["Retry-After"] = str(max(1, int(refresh_interval)))
+    return headers
+
+
+def create_response(task: AsyncTask, template: ResolvedTemplate, native_body: Any) -> Any:
+    """受理响应：原样透传上游 create 响应（New API 依赖它解析上游 task id）。"""
+    return native_body
+
+
+def output_terminal_value(status: str | TaskStatus) -> OutputTerminal:
+    return output_terminal(status)

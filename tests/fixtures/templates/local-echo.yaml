@@ -1,0 +1,30 @@
+# 测试用 echo 上游：主机名必须是可解析且被 SSRF 白名单放行的（localhost），
+# 这样 MockTransport 之外的真实校验路径（请求时刻 SSRF 检查）也参与测试。
+alias: echo
+base_url: http://localhost:9099
+create_path: /v1/tasks
+result_location: $.output.url
+id_location: $.task_id
+status_field: $.status
+terminal:
+  success: [succeeded]
+  failure: [failed]
+  expired: [expired]
+  internal_terminal_rewrite: failed
+  internal_terminal_error_code: failed
+  error_field: $.error
+capabilities:
+  upstream_idempotent: false
+  confirm_strategy: query_by_client_key
+  cancel: true
+  callback: true
+  list_tasks: true
+  per_key_isolation: true
+  rate_limit_side_effect_free: true
+normalize:
+  fields: [prompt, duration]
+strategy:
+  deadline_seconds: 120
+  max_attempts: 3
+  min_refresh_interval: 0
+pool: light-poll

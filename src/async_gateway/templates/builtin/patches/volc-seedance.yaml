@@ -1,0 +1,30 @@
+# 平台内置的逐上游差异补丁（§12.5「平台差异补丁」）
+#
+# 这些不是模板作者要写的东西，而是平台对某上游"方言与能力缺口"的既定修正；
+# 命中后字段来源标记为 patched。作者若显式声明同名字段，平台记录命中但不覆盖，
+# 便于审计发现"绕过补丁"的意图。
+patches:
+  - id: volc-ark-seedance
+    reason: >
+      火山方舟 Seedance 创建接口非幂等（无客户端幂等键），且不提供可用于确认的
+      client-key 查询/列举匹配能力 → 创建去重责任在网关；提交不确定时永不自动重发创建。
+    match_hosts:
+      - ark.cn-beijing.volces.com
+      - ark.volces.com
+    match_aliases:
+      - volc-seedance
+    fields:
+      capabilities.upstream_idempotent: false
+      capabilities.confirm_strategy: manual_only
+      capabilities.cancel: false
+      capabilities.callback: true
+      capabilities.per_key_isolation: true
+      status_field: "$.status"
+      terminal.success: ["succeeded"]
+      terminal.failure: ["failed"]
+      terminal.expired: ["expired"]
+      # 网关内部终态（timeout/dead/dead_awaiting_confirm）对外重写为上游原生失败类取值，
+      # 保证 New API 退款链路可触发（§12.2 硬规则）
+      terminal.internal_terminal_rewrite: failed
+      terminal.internal_terminal_error_code: failed
+      terminal.error_field: "$.error"

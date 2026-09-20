@@ -1,0 +1,25 @@
+# 通用 echo 上游：用于 M1 骨架闭环与本地端到端测试（不依赖任何外部服务）
+alias: echo
+base_url: http://upstream-echo:9000
+create_path: /v1/tasks
+result_location: $.output.url
+id_location: $.task_id
+status_field: $.status
+terminal:
+  success: [succeeded]
+  failure: [failed]
+  expired: [expired]
+capabilities:
+  upstream_idempotent: false
+  confirm_strategy: query_by_client_key
+  cancel: true
+  callback: true
+  list_tasks: true
+  per_key_isolation: true
+  rate_limit_side_effect_free: true
+normalize:
+  fields: [prompt, duration]
+strategy:
+  deadline_seconds: 120
+  max_attempts: 3
+notes: 本地/CI 用假上游；status 取值 queued|running|succeeded|failed

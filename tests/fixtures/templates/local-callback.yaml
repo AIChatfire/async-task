@@ -1,0 +1,21 @@
+# status_source=callback：回调即主源（用于验证"直接落库"路径与 poll 主源的仲裁路径不同）
+alias: echo-cb
+base_url: http://localhost:9099
+create_path: /v1/tasks
+result_location: $.output.url
+id_location: $.task_id
+status_field: $.status
+status_source: callback
+capabilities:
+  upstream_idempotent: false
+  confirm_strategy: manual_only
+  cancel: true
+  callback: true
+  list_tasks: false
+  per_key_isolation: true
+normalize:
+  fields: [prompt]
+strategy:
+  deadline_seconds: 120
+  max_attempts: 1
+pool: light-poll

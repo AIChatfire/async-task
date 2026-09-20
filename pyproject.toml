@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "async-gateway"
+version = "0.1.0"
+description = "通用排队异步网关：给既有上游套一层，上游零改动"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.8",
+    "pydantic-settings>=2.4",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.29",
+    "aiosqlite>=0.20",
+    "alembic>=1.13",
+    "redis>=5.0",
+    "httpx>=0.27",
+    "pyyaml>=6.0",
+    "minio>=7.2",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+queue = ["taskiq>=0.11", "taskiq-redis>=1.0"]
+obs = ["logfire>=0.50"]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "anyio>=4.4",
+    "taskiq>=0.11",
+    "taskiq-redis>=1.0",
+    "logfire>=0.50",
+]
+
+[project.scripts]
+ag-gateway = "async_gateway.__main__:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+async_gateway = ["templates/builtin/*.yaml", "templates/builtin/patches/*.yaml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q --basetemp=/tmp/ag-pytest"
+markers = [
+    "redis: requires a live Redis instance",
+    "network: requires outbound network access",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"

@@ -1,0 +1,24 @@
+# manual_only 上游：验证"永不自动重发创建 → 转人工确认"
+alias: echo-manual
+base_url: http://localhost:9099
+create_path: /v1/tasks
+result_location: $.output.url
+id_location: $.task_id
+status_field: $.status
+terminal:
+  success: [succeeded]
+  failure: [failed]
+  expired: [expired]
+capabilities:
+  upstream_idempotent: false
+  confirm_strategy: manual_only
+  cancel: false
+  callback: false
+  list_tasks: false
+  per_key_isolation: true
+normalize:
+  fields: [prompt]
+strategy:
+  deadline_seconds: 120
+  max_attempts: 1
+pool: light-poll

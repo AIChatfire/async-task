@@ -1,0 +1,19 @@
+# 极简模式样例：4 行配置 + 渠道持证（§12.5）
+# 真实上游 key 由 New API 渠道持有，随 Authorization 头透传；模板不含数据面凭证。
+# capabilities（upstream_idempotent:false / confirm_strategy:manual_only）由
+# 平台差异补丁 patches/volc-seedance.yaml 自动附加，此处不写。
+alias: volc-seedance
+base_url: https://ark.cn-beijing.volces.com/api/v3
+create_path: /contents/generations/tasks
+result_location: $.content.video_url
+
+normalize:
+  fields: [model, content, duration, resolution, ratio]
+  case_insensitive_fields: []
+
+strategy:
+  max_attempts: 1
+  deadline_seconds: 1800
+  min_refresh_interval: 3
+
+notes: 首个接入的上游；视频生成任务，创建返回 id，查询 status/queued|running|succeeded|failed|expired
