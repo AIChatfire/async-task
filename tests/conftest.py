@@ -99,6 +99,9 @@ class FakeUpstream:
         #: 查询阶段剧本：None 表示按 task 状态正常返回；否则用该状态串回答
         self.poll_script: list[str] = []
         self.poll_status_override: str | None = None
+        #: 429 剧本回给调用方的 Retry-After（秒）。默认 1；F5 类用例会把它调大，
+        #: 用来验证"上游显式要求的等待"与"重投退避上限/任务预算顺延"的边界。
+        self.retry_after_header: str = "1"
         self.result_bytes = b"FAKE-RESULT-BYTES"
         self.result_status = 200
         #: 结果拉取校验的签名期望值。真机上游的结果 URL 多为预签名（TOS 等），
@@ -147,7 +150,9 @@ class FakeUpstream:
             if script == "refused":
                 raise httpx.ConnectError("connection refused", request=request)
             if script == "rate_limited":
-                return httpx.Response(429, headers={"Retry-After": "1"}, json={"error": "slow down"})
+                return httpx.Response(
+                    429, headers={"Retry-After": self.retry_after_header}, json={"error": "slow down"}
+                )
             if script == "bad_request":
                 return httpx.Response(422, json={"error": "invalid model"})
             if script == "unauthorized":

@@ -92,6 +92,22 @@ class Settings(BaseSettings):
     poll_max_interval: float = 60.0
     poll_initial_interval: float = 5.0
     poll_hot_start_samples: int = 30
+    #: **提交重投**（429 / 401/403 释放提交意图后的重试）的退避上限（秒）。
+    #:
+    #: 为什么单独立一个上限：重投退避**不再**继承轮询的 AIMD 乘子。乘子的目的是
+    #: "按上游容忍度调慢**轮询**节奏"，把它乘到重投上会让一次限流风暴把**创建**
+    #: 也拖成 60s 级（AIMD 上限 20× × 3s）——而任务在创建成功之前毫无进展，
+    #: 只能被 deadline 收尾成 timeout（livetest-ai 报告 E2E-ASYNC-TASK-001 的 F5）。
+    #: 上游若显式给了 ``Retry-After``，那是它的明确要求，按它等（不受本上限裁剪）。
+    submit_retry_max_seconds: float = 30.0
+    #: 上游限流/渠道故障导致等待时，**顺延任务 deadline** 的累计上限（秒）。
+    #: 口径：任务预算只计算"任务自己的时间"，上游配额导致的排队不计入 —— 但必须有界，
+    #: 否则永久限流会让任务永远不收敛。默认 900s（对默认 1800s 预算 = +50%）。
+    deadline_extension_max_seconds: float = 900.0
+    #: AIMD 恢复的"静默期"（秒）：距上一次 429 超过该时长后，一次成功调用让乘子 -10%。
+    #: 没有它，一次限流风暴会把乘子顶到上限并**保留到 Redis 键 TTL（7 天）**，
+    #: 之后所有轮询/重投都按 60s 节奏跑（F5 的现场证据：无辜任务普遍等 ~59s）。
+    aimd_quiet_seconds: float = 300.0
 
     # 查询面（§12.2）
     min_refresh_interval: float = 3.0

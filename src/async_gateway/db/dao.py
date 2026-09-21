@@ -700,6 +700,7 @@ class TaskDAO:
         error_message: str | None = None,
         retryable: bool | None = None,
         attributes: dict | None = None,
+        new_deadline_at: datetime | None = None,
     ) -> bool:
         """释放本次提交意图（``submit_started_at`` 置空），让下一次 submit_upstream 能重新抢占。
 
@@ -709,6 +710,15 @@ class TaskDAO:
         ``decrement_attempts`` 用在"这一枪不算数"的场景——429 与 401/403 按 §4.1
         **不消耗业务 attempts**；而连接被拒/DNS 失败这类"请求确实发过（只是没发出去）"
         仍算一次提交尝试，不递减。
+
+        ``new_deadline_at`` 用在"等待是**上游**造成的"场景（429 / 渠道级故障）：把这一段
+        等待从任务预算里剔除（deadline 顺延）。口径见 ``docs/IMPLEMENTATION.md`` §3.18：
+        任务预算只算任务自己的时间，但**必须有界**（累计上限由调用方按
+        ``AG_DEADLINE_EXTENSION_MAX_SECONDS`` 控制）。
+
+        ⚠️ 收**绝对值**而不是"In 多少秒"：``deadline_at + interval`` 这种 SQL 侧时间运算
+        在 SQLite 上不可用（生产 PG 可用）——正是 F1 那类"单测全绿、真库报错"的坑。
+        调用方用 Python 算好绝对值，这里只做一次 CAS 写入（与释放意图同一条 UPDATE，原子）。
         """
         values: dict[str, Any] = {
             "submit_started_at": None,
@@ -717,6 +727,8 @@ class TaskDAO:
             "error_message": error_message,
             "retryable": retryable,
         }
+        if new_deadline_at is not None:
+            values["deadline_at"] = new_deadline_at
         if decrement_attempts:
             values["attempts"] = _decremented_attempts()
         if attributes:

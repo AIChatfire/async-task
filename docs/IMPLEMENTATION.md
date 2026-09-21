@@ -389,6 +389,62 @@ compose 接线 / 三个循环**行为验证**都打心跳）、`tests/test_admin
 **静态断言**；"四个非 web 容器变 healthy"需在 livetest-ai 的下一轮部署里复验（它们可**去掉**
 部署侧的探针覆盖，改由镜像自带探针判定）。
 
+### 3.18 F5：限流退避 × 任务 deadline 的联动（2026-09-21，v0.0.5）
+
+依据：livetest-ai 报告 `E2E-ASYNC-TASK-001` 最新两条 —— ① `20260921T195002-…1d51a1`（v0.0.4，
+26/26 通过，含 **T20 探针回归**：撤销部署侧探针覆盖后 7 应用容器全 healthy）把 §3.17 的四项修复
+**在真实部署上验完**；② 同一份报告的**发现表新增 `ASYNC-TASK-001-F5`（medium）**：
+
+> 渠道被限流到 AIMD 乘子上限（20×）时，重投延迟与轮询间隔都被拉到 60s；在模板 deadline=120s 下，
+> 「60s 重投 + 创建 + 60s 首次轮询」链条必然超期 ⇒ 任务被 timeout **杀掉**（而非重试成功）。
+> 根因：AIMD 乘子上限与模板 deadline 无联动校验；429 的重投 delay 直接取 `next_interval`（含乘子）
+> —— 两套机制各自合理、组合必死。
+
+**证据**：`f77799` 轮实测（Redis `poll:aimd:{echo}=20.0`）——rate_limited 任务首跳 429 → **62s 后**
+二跳 → 首次 poll 再等 ~60s，而 deadline=创建+120s ⇒ 终成 `timeout`；同轮多个无辜任务在
+`in_progress` 后也普遍等 ~59s 才推进（乘子是**渠道级**的，把所有人都拖慢了）。
+
+落地五件（对应报告的 ①②③ 三条建议）：
+
+1. **重投退避与轮询乘子解耦**（建议①的一半）。`429` / `401/403` 的释放路径不再取
+   `next_interval`（含乘子），改取**不含乘子**的 `PollingController.base_interval`，并以上限
+   `AG_SUBMIT_RETRY_MAX_SECONDS`（默认 30s）兜住；上游**显式** `Retry-After` 是明确要求，
+   按它等、不受该上限裁剪。理由：乘子的语义是"按上游容忍度调慢**轮询**节奏"，任务在
+   **创建成功之前毫无进展**，把它乘到重投上等于让一次限流风暴直接吃掉任务的全部预算。
+2. **上游造成的等待不计入任务预算**（建议①的另一半）。`release_submit_intent` 新增
+   `new_deadline_at`（收**绝对值**：`deadline_at + interval` 这种 SQL 侧时间运算在 SQLite 上不可用，
+   属 F1 那类"单测绿、真库错"的坑），handler 按顺延量算好绝对值；累计顺延有界
+   （`AG_DEADLINE_EXTENSION_MAX_SECONDS`，默认 900s，累计量记在 `attributes.deadline_extended_seconds`）。
+   有界是硬要求：429 **不消耗 attempts**，无限顺延会让持续限流的渠道里任务永不收敛。
+3. **AIMD 恢复路径接线**（此前 `note_clean_period` **只在单测里出现过** —— 生产代码从不调用它）。
+   新增 `decay_if_clean(channel, quiet_seconds)`：`note_rate_limited` 落 `poll:rl:{ch}` 时间戳，
+   距上次 429 超过 `AG_AIMD_QUIET_SECONDS`（默认 300s）后，**一次成功调用**让乘子 -10%
+   （下限 1.0）；成功路径 = `_handle_submit_result` 的成功分支 + `_handle_poll_result` 的成功分支。
+   没有它，乘子一旦被顶到上限就保留到 Redis 键 TTL（7 天）——这正是报告里"无辜任务普遍等 ~59s"的成因。
+4. **顺手修掉同路径上的既有缺陷**：`401/403` 释放意图时代码写着 `attributes={"channel_fault": True}`，
+   而 `attributes` 的写入是**整体覆盖**（不像 `note_attribute` 是读改写）⇒ 会把受理期落下的
+   `create_response_ref` 一起抹掉，幂等重放就取不到占位响应。改为释放后再 `note_attribute`
+   （合并写入）。变异验证：恢复旧写法 ⇒ `test_channel_fault_release_preserves_accepted_attributes` 立刻红。
+5. **启动期警示 + 模板出厂值校准**（建议②）。校验器新增联动判据：`deadline_seconds <= 2 ×
+   poll_max_interval` ⇒ **warning**（不阻断），文案指到本文档；`TemplateRegistry` 在**文件加载
+   （启动期）**把校验告警落日志（此前只校验、不落日志，模板作者与运维都看不到）。
+   同时把内置 `echo` 与四个 `tests/fixtures` 模板的 `deadline_seconds` 由 120 提到 **300**：
+   120s 对 `AG_POLL_MAX_INTERVAL=60s` 恰好踩在警戒线上，不该作为出厂/联调默认。
+
+新增配置三项（`.env.example` 已登记）：`AG_SUBMIT_RETRY_MAX_SECONDS`（30s）、
+`AG_DEADLINE_EXTENSION_MAX_SECONDS`（900s）、`AG_AIMD_QUIET_SECONDS`（300s）。
+
+守卫测试：`tests/test_rate_limit_deadline.py`（12 条：退避解耦 / 顺延与封顶 / AIMD 恢复 /
+渠道故障属性保全 / 校验器告警 / 注册表落日志 / 内置模板出厂值），另有两条 **Redis 真机**用例
+（`poll:rl:` 键语义、`base_interval` 不乘乘子）在 `tests/test_infra.py`。
+四条关键守卫都做过**变异验证**（把实现改回旧口径 ⇒ 对应用例立刻红）。
+另：`f77799` 轮的"重投 63.8s"在 `1d51a1` 轮（测试侧清了 `poll:aimd`）已是秒级——本轮之后
+**无需再清 Redis 的 `poll:aimd/pause/hist`**：乘子会自己恢复（第 3 件）。
+
+**未验证**：本机无 Docker/真上游 ⇒ 需 livetest-ai 下一轮复验三件事：① **不清 Redis 自适应状态**跑
+T13（重投应仍在秒级）；② 限流后**静默期内**轮询节奏应逐步回到正常（不再有"无辜任务等 59s"）；
+③ 若刻意把模板 deadline 放到 120s，启动日志应出现那条校验告警。
+
 ---
 
 ## 4. 未验证 / 待确认（评估可用性前必读）

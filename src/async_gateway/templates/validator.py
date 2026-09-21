@@ -18,6 +18,7 @@ from typing import Any, Literal
 
 from pydantic import ValidationError
 
+from ..config import get_settings
 from ..security.sanitize import is_safe_interpolation_value
 from .derive import effective_failure_status, resolve
 from .expression import ExpressionError, compile_expression, try_extract
@@ -82,6 +83,7 @@ def validate(
     *,
     sample_status_response: dict[str, Any] | None = None,
     sample_create_response: dict[str, Any] | None = None,
+    poll_max_interval: float | None = None,
 ) -> ValidationReport:
     report = ValidationReport()
     try:
@@ -106,7 +108,7 @@ def validate(
     _check_paths(resolved, report)
     _check_terminal(resolved, report)
     _check_capabilities(resolved, report)
-    _check_strategy(resolved, draft, report)
+    _check_strategy(resolved, draft, report, poll_max_interval=poll_max_interval)
     _check_credentials(resolved, report)
 
     if report.ok:
@@ -222,13 +224,24 @@ def _check_capabilities(resolved: ResolvedTemplate, report: ValidationReport) ->
 
 
 def _check_strategy(
-    resolved: ResolvedTemplate, draft: TemplateDraft, report: ValidationReport
+    resolved: ResolvedTemplate,
+    draft: TemplateDraft,
+    report: ValidationReport,
+    *,
+    poll_max_interval: float | None = None,
 ) -> None:
     strategy = resolved.strategy
     if int(strategy.get("max_attempts", 1)) < 1:
         report.add("strategy.max_attempts", "max_attempts 必须 >= 1")
     if float(strategy.get("deadline_seconds", 1)) <= 0:
         report.add("strategy.deadline_seconds", "deadline_seconds 必须 > 0")
+    deadline_warning = risky_deadline_warning(
+        float(strategy.get("deadline_seconds", 0) or 0), poll_max_interval
+    )
+    if deadline_warning:
+        # 与轮询上限的**联动**校验（F5）：单看 deadline 或单看 poll_max 都合理，
+        # 组合起来却是"任务必然超期"。这里只警示、不阻断（判断依据见 §3.18）。
+        report.add("strategy.deadline_seconds", deadline_warning, "warning")
     if float(strategy.get("min_refresh_interval", 0)) < 0:
         report.add(
             "strategy.min_refresh_interval",
@@ -242,6 +255,33 @@ def _check_strategy(
                 continue
             if key not in resolved.strategy:  # pragma: no cover - schema 已约束
                 report.add(f"strategy.{key}", "未知策略键")
+
+
+def risky_deadline_warning(
+    deadline_seconds: float, poll_max_interval: float | None = None
+) -> str | None:
+    """模板 deadline 与轮询上限的联动检查（F5）：不清楚就返回 ``None``。
+
+    判据：``deadline_seconds <= 2 × poll_max_interval`` ⇒ 警示。理由：限流退避把该渠道的
+    轮询间隔推到上限时，一次轮询就要等满 ``poll_max_interval``；若任务预算只有一两倍，
+    "重投 + 创建 + 首次轮询"链条必然超期，任务被 ``timeout`` 杀掉而不是重试成功
+    （livetest-ai 报告 E2E-ASYNC-TASK-001 的 F5）。
+
+    改法：把 ``deadline_seconds`` 提到 ``poll_max_interval`` 的 2 倍以上（生产默认
+    ``AG_TASK_DEADLINE_SECONDS=1800`` 对 ``AG_POLL_MAX_INTERVAL=60`` 是 30 倍，安全）。
+    """
+    if poll_max_interval is None:
+        poll_max_interval = float(get_settings().poll_max_interval)
+    if deadline_seconds <= 0 or poll_max_interval <= 0:
+        return None
+    if deadline_seconds <= 2 * poll_max_interval:
+        return (
+            f"deadline_seconds={deadline_seconds:g} 未显著大于轮询上限 "
+            f"poll_max_interval={poll_max_interval:g}（应 > 2 倍）：限流退避把轮询推到上限时，"
+            "重投 + 首轮询可能直接超出任务预算 ⇒ 任务被 timeout 收尾而不是重试成功"
+            "（详见 docs/IMPLEMENTATION.md §3.18）"
+        )
+    return None
 
 
 def _check_credentials(resolved: ResolvedTemplate, report: ValidationReport) -> None:

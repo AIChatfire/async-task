@@ -14,6 +14,7 @@ cancel_upstream / compensate_orphan / store_result。
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -47,9 +48,82 @@ MAX_TRANSFER_ATTEMPTS = 5
 #: poll 404 连续出现多少次后转确认（多 key 轮换 / 任务空间不匹配的兜底）
 POLL_404_CONFIRM_THRESHOLD = 3
 
+logger = logging.getLogger(__name__)
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _deadline_extension(task: AsyncTask, *, want: float, cap: float) -> float:
+    """把"等待是上游造成的"那段时间从任务预算里剔除（累计有界）。
+
+    为什么要有界：429 不消耗 attempts，若无限顺延，持续限流的渠道会让任务**永远不死**
+    （既占着查询面，也让调用方永远等不到终态）。上限见
+    ``AG_DEADLINE_EXTENSION_MAX_SECONDS``；累计量记在 ``attributes`` 里（合并写入，
+    不会覆盖 ``create_response_ref`` 这类受理期落下的引用）。
+    """
+    used = float((task.attributes or {}).get("deadline_extended_seconds", 0.0) or 0.0)
+    return max(0.0, min(float(want), max(0.0, cap - used)))
+
+
+async def _note_channel_healthy(ctx: "HandlerContext", channel: str) -> None:
+    """一次成功调用 = 一个"干净周期"：429 静默期满后让 AIMD 乘子回落一步（§3.18）。
+
+    没有这条恢复路径时，乘子被顶到上限后会**保留到 Redis 键 TTL（7 天）**，
+    之后所有轮询都按 60s 节奏跑（F5 现场：无辜任务普遍等 ~59s 才推进）。
+    恢复只是优化项，任何异常都不许影响主链路。
+    """
+    try:
+        await ctx.container.polling.decay_if_clean(
+            channel, quiet_seconds=float(ctx.settings.aimd_quiet_seconds)
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("aimd decay skipped channel=%s", channel, exc_info=True)
+
+
+async def _release_for_upstream_wait(
+    ctx: "HandlerContext",
+    task: AsyncTask,
+    *,
+    expected: list[TaskStatus],
+    delay: float,
+    code: str,
+    message: str | None,
+    decrement_attempts: bool,
+) -> bool:
+    """429 / 渠道级故障的统一释放路径：**重投 + 顺延 deadline（有界）**。
+
+    与旧口径的区别（两者都是 F5 的根因）：
+
+    1. ``delay`` 由调用方给出，**不再**取含 AIMD 乘子的 ``next_interval``；
+    2. 等待期从任务预算里剔除 —— 否则"60s 重投 + 首次轮询 60s"必然把模板 deadline
+       （如 echo 的 120s）撑爆，任务被 ``timeout`` 杀掉而不是重试成功。
+    """
+    extension = _deadline_extension(
+        task, want=delay, cap=float(ctx.settings.deadline_extension_max_seconds)
+    )
+    new_deadline = (
+        task.deadline_at + timedelta(seconds=extension)
+        if task.deadline_at is not None and extension > 0
+        else None
+    )
+    released = await _apply(
+        "release_submit_intent", task.task_id, expected=expected,
+        next_poll_at=_now() + timedelta(seconds=delay),
+        decrement_attempts=decrement_attempts, error_code=code, error_message=message,
+        retryable=True, new_deadline_at=new_deadline,
+    )
+    if released and extension > 0:
+        used = float((task.attributes or {}).get("deadline_extended_seconds", 0.0) or 0.0)
+        # 合并写入（note_attribute 读改写）：直接塞 attributes 会把受理期落下的
+        # create_response_ref 抹掉，幂等重放就拿不到占位响应了。
+        await _apply("note_attribute", task.task_id, deadline_extended_seconds=used + extension)
+        logger.info(
+            "deadline extended task_id=%s extend=%.1fs total=%.1fs（上游造成的等待不计入任务预算）",
+            task.task_id, extension, used + extension,
+        )
+    return bool(released)
 
 
 async def _load(task_id: str) -> AsyncTask | None:
@@ -332,6 +406,7 @@ async def _handle_submit_result(
         if task.cancel_requested:
             # submit 落库后强制检查 cancel_requested：杜绝"用户已取消、上游仍跑"
             await ctx.enqueue("cancel:default", "cancel_upstream")
+        await _note_channel_healthy(ctx, task.channel)
         await ctx.enqueue(poll_queue(template.pool), "poll_upstream")
         return
 
@@ -341,28 +416,36 @@ async def _handle_submit_result(
 
     # ---- 429：不消耗业务 attempts，独立退避 ----
     if classification.error_class.value == "rate_limited":
-        delay = max(
-            result.retry_after or 0.0,
-            await ctx.container.polling.next_interval(task.channel, elapsed=0.0, first_poll=True),
+        # 退避**不取含 AIMD 乘子的轮询间隔**（F5）：乘子是"按上游容忍度调慢**轮询**节奏"，
+        # 乘到重投上会让一次限流风暴把**创建**也拖到 60s 级，任务在创建成功前毫无进展 ⇒
+        # 被 deadline 收尾成 timeout。上游显式 Retry-After 是明确要求 ⇒ 尊重它；
+        # 否则按**不含乘子**的基准间隔退避，并以上限兜住。
+        base = await ctx.container.polling.base_interval(
+            task.channel, elapsed=0.0, first_poll=True
+        )
+        delay = float(result.retry_after or 0.0) or min(
+            base, float(ctx.settings.submit_retry_max_seconds)
         )
         await ctx.container.polling.note_rate_limited(task.channel, result.retry_after)
-        await _apply(
-            "release_submit_intent", task.task_id, expected=expected,
-            next_poll_at=_now() + timedelta(seconds=delay),
-            decrement_attempts=True, error_code=code,
-            error_message=result.safe_error(), retryable=True,
+        await _release_for_upstream_wait(
+            ctx, task, expected=expected, delay=delay, code=code,
+            message=result.safe_error(), decrement_attempts=True,
         )
         return
 
     # ---- 401/403：渠道级故障，烧的不是任务 attempts ----
     if classification.channel_fault:
         await ctx.container.polling.note_rate_limited(task.channel, None)
-        await _apply(
-            "release_submit_intent", task.task_id, expected=expected,
-            next_poll_at=_now() + timedelta(seconds=backoff_seconds(task.attempts, base=5.0, cap=300.0)),
-            decrement_attempts=True, error_code=code, error_message=result.safe_error(),
-            retryable=True, attributes={"channel_fault": True},
+        # 渠道级故障的退避曲线刻意比 429 长（换 key 需要人工介入），但它同样属于
+        # "等待是上游/渠道造成的" ⇒ 走同一条"顺延 deadline"的释放路径，不许把任务等死。
+        await _release_for_upstream_wait(
+            ctx, task, expected=expected,
+            delay=backoff_seconds(task.attempts, base=5.0, cap=300.0), code=code,
+            message=result.safe_error(), decrement_attempts=True,
         )
+        # channel_fault 标记走**合并写入**（旧实现把它塞进 release 的 attributes，
+        # 那是一次整体覆盖 ⇒ 会把受理期的 create_response_ref 一起抹掉）。
+        await _apply("note_attribute", task.task_id, channel_fault=True)
         await _audit(
             AuditEventType.GOVERNANCE,
             subject_type="channel",
@@ -546,6 +629,8 @@ async def _handle_poll_result(
         return
 
     # ---- 成功响应：判定终态 ----
+    # 上游能正常应答 = 渠道已恢复；429 静默期满即让 AIMD 乘子回落一步（§3.18 恢复路径）
+    await _note_channel_healthy(ctx, task.channel)
     body = result.response.json_body if result.response else None
     found_status, raw_status = try_extract(body or {}, template.status_field)
     native = str(raw_status) if found_status else None

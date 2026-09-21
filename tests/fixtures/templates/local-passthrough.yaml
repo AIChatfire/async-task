@@ -22,6 +22,6 @@ result_policy:
 normalize:
   fields: [prompt]
 strategy:
-  deadline_seconds: 120
+  deadline_seconds: 300
   max_attempts: 1
 pool: light-poll

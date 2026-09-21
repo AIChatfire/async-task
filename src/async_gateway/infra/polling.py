@@ -8,6 +8,12 @@
 * **限流驱动（AIMD）**：429 时该渠道间隔 ×2（上限 60s）并暂停派发至 ``retry_after``；
   每过一个无 429 周期恢复 -10%，下限 1.0。
 
+⚠️ **乘子只乘轮询，不乘重投**（2026-09-21 修 F5，见 ``docs/IMPLEMENTATION.md`` §3.18）：
+重投（创建被 429 拒绝后的重试）走 :meth:`_BasePolling.base_interval`——它不含乘子，
+上限由 ``AG_SUBMIT_RETRY_MAX_SECONDS`` 兜。乘子的本意是"按上游容忍度调慢**轮询**节奏"，
+把它乘到重投上会让一次限流风暴把**创建**也拖到 60s 级，而任务在创建成功前毫无进展 ⇒
+被 deadline 收尾成 timeout（livetest-ai 报告 E2E-ASYNC-TASK-001 的 F5 现场）。
+
 直方图存 Redis 桶计数滑动窗口 7 天（10s 分桶，HINCRBY + 键 TTL 滚动过期），
 P10/P50/P95 每 5 分钟重算并缓存——万级并发下这条曲线是省上游配额的主要来源。
 """
@@ -64,8 +70,10 @@ class PollingController(Protocol):
     async def record_duration(self, channel: str, seconds: float) -> None: ...
     async def record_terminal(self, channel: str, seconds: float) -> None: ...
     async def next_interval(self, channel: str, *, elapsed: float, first_poll: bool = False) -> float: ...
+    async def base_interval(self, channel: str, *, elapsed: float, first_poll: bool = False) -> float: ...
     async def note_rate_limited(self, channel: str, retry_after: float | None) -> float: ...
     async def note_clean_period(self, channel: str) -> float: ...
+    async def decay_if_clean(self, channel: str, *, quiet_seconds: float) -> float | None: ...
     async def paused_for(self, channel: str) -> float: ...
 
 
@@ -123,6 +131,14 @@ class RedisPollingController(_BasePolling):
     def _pause_key(self, channel: str) -> str:
         return f"poll:pause:{{{channel}}}"
 
+    def _rl_key(self, channel: str) -> str:
+        return f"poll:rl:{{{channel}}}"
+
+    @property
+    def _rl_ttl_seconds(self) -> int:
+        # 比静默期长即可；给足余量避免键先过期而被误判为"从未 429"
+        return max(600, int(get_settings().aimd_quiet_seconds * 3))
+
     async def record_duration(self, channel: str, seconds: float) -> None:
         client = get_redis()
         key = self._hist_key(channel)
@@ -164,11 +180,18 @@ class RedisPollingController(_BasePolling):
         multiplier = await self._multiplier(channel)
         return self.clamp(interval * multiplier)
 
+    async def base_interval(self, channel: str, *, elapsed: float, first_poll: bool = False) -> float:
+        """**不含 AIMD 乘子**的间隔（重投退避用，见模块 docstring 与 §3.18）。"""
+        stats = await self.stats(channel)
+        return self.compute_interval(elapsed, stats, first_poll=first_poll)
+
     async def note_rate_limited(self, channel: str, retry_after: float | None = None) -> float:
         client = get_redis()
         current = await self._multiplier(channel)
         new = self.aimd_up(current)
         await client.set(self._aimd_key(channel), new, ex=HIST_TTL_SECONDS)
+        # 记录"上一次 429 时刻"：AIMD 恢复（decay_if_clean）靠它判断静默期
+        await client.set(self._rl_key(channel), time.time(), ex=self._rl_ttl_seconds)
         pause = max(0.0, float(retry_after or 0.0))
         if pause > 0:
             await client.set(self._pause_key(channel), time.time() + pause, ex=max(60, int(pause) + 60))
@@ -180,6 +203,17 @@ class RedisPollingController(_BasePolling):
         new = self.aimd_down(current)
         await client.set(self._aimd_key(channel), new, ex=HIST_TTL_SECONDS)
         return new
+
+    async def decay_if_clean(self, channel: str, *, quiet_seconds: float) -> float | None:
+        """距上次 429 已静默 ``quiet_seconds`` ⇒ 乘子回落一步；否则不动（返回 ``None``）。"""
+        raw = await get_redis().get(self._rl_key(channel))
+        try:
+            last = float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            last = None
+        if last is not None and (time.time() - last) < quiet_seconds:
+            return None
+        return await self.note_clean_period(channel)
 
     async def paused_for(self, channel: str) -> float:
         client = get_redis()
@@ -204,6 +238,7 @@ class MemoryPollingController(_BasePolling):
         self.buckets: dict[str, dict[int, int]] = {}
         self.multiplier: dict[str, float] = {}
         self.pause_until: dict[str, float] = {}
+        self.last_rate_limited: dict[str, float] = {}
 
     async def record_duration(self, channel: str, seconds: float) -> None:
         label = int(seconds // BUCKET_SECONDS) * BUCKET_SECONDS
@@ -230,10 +265,16 @@ class MemoryPollingController(_BasePolling):
         base_interval = self.compute_interval(elapsed, stats, first_poll=first_poll)
         return self.clamp(base_interval * self.multiplier.get(channel, AIMD_MIN))
 
+    async def base_interval(self, channel: str, *, elapsed: float, first_poll: bool = False) -> float:
+        """**不含 AIMD 乘子**的间隔（重投退避用，见模块 docstring 与 §3.18）。"""
+        stats = await self.stats(channel)
+        return self.compute_interval(elapsed, stats, first_poll=first_poll)
+
     async def note_rate_limited(self, channel: str, retry_after: float | None = None) -> float:
         current = self.multiplier.get(channel, AIMD_MIN)
         new = self.aimd_up(current)
         self.multiplier[channel] = new
+        self.last_rate_limited[channel] = time.monotonic()
         if retry_after:
             self.pause_until[channel] = time.monotonic() + float(retry_after)
         return new
@@ -242,6 +283,13 @@ class MemoryPollingController(_BasePolling):
         new = self.aimd_down(self.multiplier.get(channel, AIMD_MIN))
         self.multiplier[channel] = new
         return new
+
+    async def decay_if_clean(self, channel: str, *, quiet_seconds: float) -> float | None:
+        """距上次 429 已静默 ``quiet_seconds`` ⇒ 乘子回落一步；否则不动（返回 ``None``）。"""
+        last = self.last_rate_limited.get(channel)
+        if last is not None and (time.monotonic() - last) < quiet_seconds:
+            return None
+        return await self.note_clean_period(channel)
 
     async def paused_for(self, channel: str) -> float:
         return max(0.0, self.pause_until.get(channel, 0.0) - time.monotonic())

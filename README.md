@@ -52,7 +52,7 @@ cp .env.example .env    # 然后按顶部清单逐条改；切勿提交 .env
 
 ```bash
 make install        # pip install -e ".[dev]"
-make test           # 233 项测试（SQLite + 内存 broker + MockTransport 假上游，无需 Redis）
+make test           # 245 项测试（SQLite + 内存 broker + MockTransport 假上游，无需 Redis）
 make test-all       # 追加 Redis 真机用例（Lua 原子性 / Streams 消费组 / AIMD 直方图）
 
 make gateway        # http://localhost:8000  （/docs 在非 prod 环境开放）
@@ -130,3 +130,8 @@ python /app/scripts/healthcheck.py --role worker
    envelope `degraded[]` 声明 `transfer_disabled`）；代价是直链依赖上游有效期。
    切到 `store` 转存时必须保证**数据面 IO 用原始 URL**：上游结果多为预签名地址，
    脱敏只作用于对外输出（见 `docs/IMPLEMENTATION.md` §3.11、§3.13、§3.16）。
+7. **上游造成的等待不计入任务预算；退避乘子只管轮询，不管重投**：限流（429）与渠道故障
+   （401/403）的等待期从 deadline 里**顺延**（累计上限 `AG_DEADLINE_EXTENSION_MAX_SECONDS`）；
+   重投按上游 `Retry-After`（或基准间隔，上限 `AG_SUBMIT_RETRY_MAX_SECONDS`）走，**不乘**
+   轮询的 AIMD 乘子；乘子在 429 静默期（`AG_AIMD_QUIET_SECONDS`）后自动回落。
+   三条一起保证"限流期是**排队**，不是任务全灭"（见 `docs/IMPLEMENTATION.md` §3.18）。

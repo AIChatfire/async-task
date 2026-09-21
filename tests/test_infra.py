@@ -305,3 +305,37 @@ def test_result_store_is_none_when_s3_unconfigured():
         assert get_result_store() is None
     finally:
         set_result_store(MemoryResultStore())
+
+
+@pytest.mark.redis
+async def test_redis_aimd_recovers_after_quiet_period(redis_client):
+    """AIMD 恢复在**真 Redis** 上也要成立（F5）：乘子上升会写 `poll:rl:`，静默期满才回落。
+
+    单测只覆盖内存实现；这条钉住真机键语义（键名/取值/TTL），因为生产的轮询控制器就是它。
+    """
+    from async_gateway.infra.polling import RedisPollingController
+
+    ctrl = RedisPollingController(base=3.0, minimum=3.0, maximum=60.0, initial=5.0)
+    await ctrl.note_rate_limited("chRL", retry_after=None)
+    assert float(await redis_client.get("poll:aimd:{chRL}")) == 2.0
+    assert await redis_client.get("poll:rl:{chRL}") is not None, "429 时刻必须落键（恢复判据）"
+
+    # 静默期未满 ⇒ 不回落
+    assert await ctrl.decay_if_clean("chRL", quiet_seconds=3600) is None
+    assert float(await redis_client.get("poll:aimd:{chRL}")) == 2.0
+    # 静默期满 ⇒ 回落一步（-10%）
+    assert await ctrl.decay_if_clean("chRL", quiet_seconds=0) == pytest.approx(1.8)
+
+
+@pytest.mark.redis
+async def test_redis_next_interval_ignores_multiplier_for_base_interval(redis_client):
+    """`base_interval`（重投退避用）不乘 AIMD 乘子；`next_interval`（轮询用）乘 —— 两者都真机验。"""
+    from async_gateway.infra.polling import RedisPollingController
+
+    ctrl = RedisPollingController(base=3.0, minimum=3.0, maximum=60.0, initial=5.0)
+    base_before = await ctrl.base_interval("chBI", elapsed=0.0, first_poll=True)
+    poll_before = await ctrl.next_interval("chBI", elapsed=0.0, first_poll=True)
+    for _ in range(8):
+        await ctrl.note_rate_limited("chBI", None)  # 乘子顶到上限（60/3 = 20×）
+    assert await ctrl.base_interval("chBI", elapsed=0.0, first_poll=True) == base_before
+    assert await ctrl.next_interval("chBI", elapsed=0.0, first_poll=True) > poll_before * 5

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
@@ -24,6 +25,8 @@ import yaml
 from .derive import PlatformPatch, load_builtin_patches, resolve
 from .schema import ResolvedTemplate, TemplateDraft
 from .validator import ValidationReport, validate
+
+logger = logging.getLogger(__name__)
 
 BUILTIN_DIR = Path(__file__).parent / "builtin"
 
@@ -193,6 +196,12 @@ class TemplateRegistry:
         report = validate(raw)
         if validate_first and not report.ok:
             return None, report  # type: ignore[return-value]
+        # 校验**告警**（不改 ok 的那些）在此落日志：模板从文件加载时（启动期）最容易漏看，
+        # 而它们往往正是"两套机制各自合理、组合必死"的那类问题（例：deadline 与轮询上限，F5）
+        for issue in report.warnings:
+            logger.warning(
+                "模板校验告警 alias=%s field=%s: %s", raw.get("alias") or "?", issue.field, issue.message
+            )
         resolved = report.resolved or resolve(TemplateDraft.model_validate(raw), patches=self._patches)
         existing = self._versions.get(resolved.alias, [])
         next_version = version or (max((v.version for v in existing), default=0) + 1)

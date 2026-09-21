@@ -20,6 +20,9 @@ capabilities:
 normalize:
   fields: [prompt, duration]
 strategy:
-  deadline_seconds: 120
+  # 300s 而不是 120s：轮询上限（AG_POLL_MAX_INTERVAL=60s）在限流退避期会把轮询节奏推到 60s，
+  # 任务预算若只有 2×60s，"重投 + 创建 + 首次轮询"链条必然超期 ⇒ 任务被 timeout 收尾
+  # 而不是重试成功（livetest-ai 报告 F5；校验器对该组合有告警，见 IMPLEMENTATION §3.18）。
+  deadline_seconds: 300
   max_attempts: 3
 notes: 本地/CI 用假上游；status 取值 queued|running|succeeded|failed
