@@ -113,6 +113,16 @@ python /app/scripts/healthcheck.py --role worker
 ⚠️ `AG_PROBE_MAX_AGE_SECONDS`（默认 120s）必须**大于最长单条消息处理时长**
 （`AG_SUBMIT_READ_TIMEOUT` × 3 = 90s），否则忙时的 worker 会被自己的探针判死。
 
+## 运维杠杆（治理面）
+
+| 端点 | 用途 |
+|---|---|
+| `GET /admin/channels/{channel}/pacing` | 渠道**自适应（限流）状态**：乘子 / 暂停位 / 上次 429 时刻 / 时长样本，并把两个间隔**并排**给出——`next_poll_interval`（含乘子 = 轮询节奏）与 `resubmit_base_interval`（不含乘子 = 重投基准） |
+| `POST /admin/channels/{channel}/pacing/reset` | **立即复位**限流惩罚（`poll:aimd/pause/rl`）：上游限流已恢复但乘子还顶在上限时，不必等静默期逐步回落、也不必手工去 Redis 删键；`{"include_samples": true}` 才连时长学习样本一起清（默认保留） |
+
+写操作要 `operator`/`approver` 角色并写 append-only 审计（记 before/after 乘子）；
+渠道名按白名单字符集收口（它要进 Redis 键）。口径见 `docs/IMPLEMENTATION.md` §3.19。
+
 ## 设计上的几个硬约束
 
 1. **不猜成功**：响应超时/丢失/5xx → `submit_unknown`，只能由 compensate 按

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -892,6 +893,81 @@ async def verify_audit(actor: Actor = Depends(require("auditor", "approver"))) -
     async with session_scope() as s:
         ok, reason = await AuditWriter(s).verify_chain(limit=10_000)
     return {"ok": ok, "reason": reason}
+
+
+# ----------------------------------------------------------------------------- 渠道自适应状态
+#: 渠道名进 Redis 键（``poll:aimd:{channel}`` 等）⇒ 必须按白名单字符集收口，
+#: 否则治理面就成了"任意 Redis 键的读写把手"（hash-tag ``{}`` 还能影响集群分片）。
+_CHANNEL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def _validated_channel(channel: str) -> str:
+    if not _CHANNEL_RE.match(channel or ""):
+        raise HTTPException(
+            status_code=400,
+            detail="invalid channel name: 只允许小写字母/数字/._-，1–64 字符，首字符为字母或数字",
+        )
+    return channel
+
+
+@router.get("/channels/{channel}/pacing")
+async def get_channel_pacing(channel: str, actor: Actor = Depends(require(*ALL_ROLES))) -> dict[str, Any]:
+    """渠道**自适应（限流）状态**：乘子 / 暂停位 / 上次 429 / 样本，外加两个间隔的即时计算。
+
+    为什么把两个间隔并排给出：F5 的根因正是"轮询节奏"与"重投退避"被同一个 AIMD 乘子绑在
+    一起（§3.18）。运维要能一眼看出「轮询被放慢了多少（``next_poll_interval``）」与
+    「重投基准是多少（``resubmit_base_interval``，不含乘子）」，而不是去 Redis 里翻键。
+    """
+    channel = _validated_channel(channel)
+    polling = get_container().polling
+    payload: dict[str, Any] = dict(await polling.snapshot(channel))
+    payload["next_poll_interval"] = round(
+        await polling.next_interval(channel, elapsed=0.0, first_poll=True), 3
+    )
+    payload["resubmit_base_interval"] = round(
+        await polling.base_interval(channel, elapsed=0.0, first_poll=True), 3
+    )
+    return payload
+
+
+@router.post("/channels/{channel}/pacing/reset")
+async def reset_channel_pacing(
+    channel: str,
+    request: Request,
+    body: dict[str, Any] | None = None,
+    actor: Actor = Depends(require("operator", "approver")),
+) -> dict[str, Any]:
+    """复位渠道自适应状态（限流惩罚 + **可选**样本）。
+
+    用途（两条都是线上真问题）：① 上游限流已恢复，但乘子还顶在上限 —— 全渠道轮询被拖到
+    60s 级（F5 现场："无辜任务普遍等 ~59s"），运维不该只能等静默期逐步回落、或手工去
+    Redis 删键（livetest 测试侧此前就是这么绕的，本轮把它变成受支持路径）；② 渠道整改后
+    需要把"时长学习样本"一起清掉重学。
+
+    口径与取舍：
+    * **默认不清样本** —— 限流惩罚与时长学习是两件事，复位前者不必牺牲后者；
+      ``{"include_samples": true}`` 才连直方图与百分位缓存一起清（会丢学习成果）。
+    * **不做双人复核**：复位只影响"节奏"，不改任何任务状态、不触上游调用（与重放/灰度
+      那类高危动作不同），operator 角色 + append-only 审计足够。
+    """
+    channel = _validated_channel(channel)
+    include_samples = bool((body or {}).get("include_samples", False))
+    result = await get_container().polling.reset(channel, include_samples=include_samples)
+    await audit(
+        AuditEventType.GOVERNANCE,
+        actor=actor,
+        subject_type="channel",
+        subject_id=channel,
+        refs={
+            "operation": "pacing.reset",
+            "include_samples": include_samples,
+            "before": (result.get("before") or {}).get("multiplier"),
+            "after": (result.get("after") or {}).get("multiplier"),
+        },
+        detail="复位渠道自适应状态（限流乘子/暂停位；可选清样本）",
+    )
+    GOVERNANCE_TOTAL.inc({"action": "channel.pacing.reset"})
+    return {"channel": channel, **result}
 
 
 @router.get("/metrics", include_in_schema=False)

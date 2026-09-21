@@ -339,3 +339,42 @@ async def test_redis_next_interval_ignores_multiplier_for_base_interval(redis_cl
         await ctrl.note_rate_limited("chBI", None)  # 乘子顶到上限（60/3 = 20×）
     assert await ctrl.base_interval("chBI", elapsed=0.0, first_poll=True) == base_before
     assert await ctrl.next_interval("chBI", elapsed=0.0, first_poll=True) > poll_before * 5
+
+
+@pytest.mark.redis
+async def test_redis_pacing_snapshot_and_reset(redis_client):
+    """治理面的「渠道自适应状态」是真机键操作 ⇒ 必须在真 Redis 上验键名与复位语义（§3.19）。
+
+    内存实现的用例再多也证明不了键名/键型/删键顺序（F1 的教训：单测绿、真库错）。
+    """
+    from async_gateway.infra.polling import RedisPollingController
+
+    ctrl = RedisPollingController(base=3.0, minimum=3.0, maximum=60.0, initial=5.0)
+    channel = "chPace"
+    for _ in range(8):
+        await ctrl.note_rate_limited(channel, retry_after=30.0)  # 乘子顶到上限 20×
+    await ctrl.record_terminal(channel, 12.0)  # 时长样本（复位默认不得清）
+
+    snap = await ctrl.snapshot(channel)
+    assert snap["multiplier"] == pytest.approx(20.0)
+    assert snap["max_multiplier"] == pytest.approx(20.0)
+    assert snap["paused_for"] > 0
+    assert snap["last_rate_limited_at"] is not None
+    assert snap["samples"] == 1
+
+    kept = await ctrl.reset(channel)  # 默认保留样本
+    assert kept["before"]["multiplier"] == pytest.approx(20.0)  # type: ignore[index]
+    after = kept["after"]  # type: ignore[index]
+    assert after["multiplier"] == 1.0  # type: ignore[index]
+    assert after["paused_for"] == 0.0  # type: ignore[index]
+    assert after["last_rate_limited_at"] is None  # type: ignore[index]
+    assert after["samples"] == 1, "默认不得清样本"  # type: ignore[index]
+    # 键真的没了（乘子回落到 AIMD_MIN 而不是"某个残留值"）
+    assert await redis_client.get("poll:aimd:{chPace}") is None
+    assert await redis_client.get("poll:pause:{chPace}") is None
+    assert await ctrl.current_multiplier(channel) == 1.0
+
+    await ctrl.note_rate_limited(channel, None)  # 再污染一次
+    cleaned = await ctrl.reset(channel, include_samples=True)
+    assert cleaned["after"]["samples"] == 0  # type: ignore[index]
+    assert await redis_client.hgetall("poll:hist:{chPace}") == {}

@@ -284,3 +284,48 @@ def _effective_deadline_seconds(container, alias: str = "echo") -> float:
     tv = container.registry.get(alias)
     assert tv is not None, f"模板 {alias} 未注册"
     return float(tv.resolved.strategy.get("deadline_seconds", 0))
+
+
+async def test_deadline_extension_saturates_across_cycles(client, container, fake_upstream, db, monkeypatch):
+    """顺延**触顶**：连续两轮限流等待不得把预算越推越远（累计口径，跨周期也成立）。
+
+    livetest 报告把"顺延上限触顶"列为未覆盖项（黑盒难以把 900s 跑满）——
+    产品侧用一个小上限把它压成一个可断言的事实：第二轮 want 再大，allowed 也只剩 0。
+    """
+    monkeypatch.setattr(container.settings, "deadline_extension_max_seconds", 3.0)
+    fake_upstream.retry_after_header = "600"  # 上游要求等 10 分钟 ⇒ 单轮 want=600 ≫ cap
+    fake_upstream.queue_create("rate_limited", "rate_limited")
+
+    created = await client.post(CREATE_PATH, json={"prompt": "saturate"}, headers=AUTH)
+    task_id = created.headers["x-ag-task-id"]
+    first = await _task(task_id)
+    assert float((first.attributes or {})["deadline_extended_seconds"]) == pytest.approx(3.0)
+    deadline_after_first = first.deadline_at
+    original_deadline = first.created_at + timedelta(seconds=_effective_deadline_seconds(container))
+
+    # 第二轮：退避到期 → 再次被 429 → want 仍是 600，但累计已满 ⇒ 不许再顺延
+    from async_gateway.tasks.handlers import dispatch_message
+    from async_gateway.workers.scheduler import dispatch_due
+
+    async with session_scope() as s:
+        assert await TaskDAO(s).schedule_next_poll(task_id, _now() - timedelta(seconds=1))
+    assert await dispatch_due(container.bus, batch_size=10, lease_seconds=60) == 1
+    for message in await container.bus.consume("submit:default", consumer="test", count=10, block_ms=0):
+        await dispatch_message(message.payload, message.name, container.bus, container)
+
+    second = await _task(task_id)
+    assert float((second.attributes or {})["deadline_extended_seconds"]) == pytest.approx(3.0), (
+        "累计顺延必须停在 AG_DEADLINE_EXTENSION_MAX_SECONDS，实得 "
+        f"{(second.attributes or {}).get('deadline_extended_seconds')}"
+    )
+    assert second.deadline_at == deadline_after_first, "触顶后 deadline 不得继续前移"
+
+    # 语义核对：名义预算已过、顺延窗口未到 ⇒ 巡检**不得**判超期（这就是"等待不计入预算"）
+    async with session_scope() as s:
+        dao = TaskDAO(s)
+        overdue_at_nominal = list(await dao.overdue_deadlines(now=original_deadline + timedelta(seconds=1)))
+        overdue_after_window = list(
+            await dao.overdue_deadlines(now=deadline_after_first + timedelta(seconds=1))
+        )
+    assert task_id not in {t.task_id for t in overdue_at_nominal}, "顺延窗口内不得判超期"
+    assert task_id in {t.task_id for t in overdue_after_window}, "顺延也用尽后必须能收敛（有界）"

@@ -411,3 +411,106 @@ async def _async_true() -> bool:
 
 async def _async_false() -> bool:
     return False
+
+
+# ------------------------------------------------------------------ 渠道自适应状态（§3.19）
+async def _pollute(container, channel: str = "echo", times: int = 6) -> float:
+    for _ in range(times):
+        await container.polling.note_rate_limited(channel, 3.0)
+    return float(await container.polling.current_multiplier(channel))
+
+
+async def test_channel_pacing_view_reports_baseline_and_needs_auth(admin, container):
+    """未带身份不得读（401）；基线态乘子=1，两个间隔相等（还没有限流惩罚）。"""
+    assert (await admin.get("/admin/channels/echo/pacing")).status_code == 401
+    response = await admin.get("/admin/channels/echo/pacing", headers=OPERATOR)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    polling = container.polling
+    assert payload["multiplier"] == 1.0
+    assert payload["paused_for"] == 0.0
+    # 乘子上限由 poll_max / poll_base 推出（不写死数字：测试基座把轮询间隔钉在 0.01s 级）
+    assert payload["max_multiplier"] == pytest.approx(polling.maximum / polling.base)
+    assert payload["next_poll_interval"] == payload["resubmit_base_interval"]
+    assert payload["samples"] == 0 and payload["warm"] is False
+
+
+async def test_channel_pacing_view_exposes_multiplier_apart_from_resubmit_base(admin, container):
+    """F5 语义必须**看得见**：轮询被乘子放慢，重投基准不受影响（§3.18 的两条曲线）。"""
+    await _pollute(container)
+    payload = (await admin.get("/admin/channels/echo/pacing", headers=OPERATOR)).json()
+    polling = container.polling
+    assert payload["multiplier"] > 1.0
+    assert payload["paused_for"] > 0
+    assert payload["last_rate_limited_at"] is not None
+    assert payload["next_poll_interval"] > payload["resubmit_base_interval"], payload
+    # 重投基准 = **不含乘子**的冷启动首轮间隔（§3.18 的核心口径）
+    assert payload["resubmit_base_interval"] == pytest.approx(polling.clamp(polling.initial))
+    assert payload["next_poll_interval"] == pytest.approx(
+        polling.clamp(payload["resubmit_base_interval"] * payload["multiplier"])
+    )
+
+
+async def test_channel_pacing_reset_clears_penalty_and_is_audited(admin, container):
+    """复位 = 运维杠杆：不必等静默期、也不必手工去 Redis 删键（旧口径的 workaround）。"""
+    await _pollute(container)
+    assert float(await container.polling.current_multiplier("echo")) > 1.0
+
+    # 读角色不能复位（写操作要 operator/approver）
+    assert (
+        await admin.post("/admin/channels/echo/pacing/reset", headers=AUDITOR)
+    ).status_code == 403
+    # 未知角色连读都进不来
+    assert (await admin.get("/admin/channels/echo/pacing", headers=NOBODY)).status_code == 403
+
+    response = await admin.post("/admin/channels/echo/pacing/reset", headers=OPERATOR)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["before"]["multiplier"] > 1.0
+    assert payload["after"]["multiplier"] == 1.0
+    assert payload["after"]["paused_for"] == 0.0
+    assert payload["after"]["last_rate_limited_at"] is None
+    assert payload["include_samples"] is False
+
+    # 复位后：乘子回 1.0、轮询与重投基准重新相等
+    assert float(await container.polling.current_multiplier("echo")) == 1.0
+    view = (await admin.get("/admin/channels/echo/pacing", headers=OPERATOR)).json()
+    assert view["multiplier"] == 1.0
+    assert view["next_poll_interval"] == view["resubmit_base_interval"]
+
+    # append-only 审计留痕（谁在什么时候把乘子从多少清到多少）
+    events = (await admin.get("/admin/audit", headers=AUDITOR)).json()["events"]
+    reset_events = [e for e in events if (e.get("refs") or {}).get("operation") == "pacing.reset"]
+    assert reset_events, events[:3]
+    assert reset_events[0]["subject"] == "channel:echo"
+    assert reset_events[0]["actor"] == "carol"  # OPERATOR 的身份
+
+    # 幂等：再复位一次不报错
+    assert (await admin.post("/admin/channels/echo/pacing/reset", headers=OPERATOR)).status_code == 200
+
+
+async def test_channel_pacing_reset_keeps_samples_by_default(admin, container):
+    """默认**不清样本**：限流惩罚与时长学习是两件事，复位前者不该牺牲后者。"""
+    await container.polling.record_terminal("echo", 12.0)
+    await container.polling.record_terminal("echo", 12.0)
+    before = (await admin.get("/admin/channels/echo/pacing", headers=OPERATOR)).json()
+    assert before["samples"] == 2
+
+    kept = (await admin.post("/admin/channels/echo/pacing/reset", headers=OPERATOR)).json()
+    assert kept["after"]["samples"] == 2, "默认不得清样本"
+
+    cleared = (
+        await admin.post(
+            "/admin/channels/echo/pacing/reset",
+            json={"include_samples": True},
+            headers=OPERATOR,
+        )
+    ).json()
+    assert cleared["after"]["samples"] == 0, "显式 include_samples 才清学习样本"
+
+
+async def test_channel_pacing_rejects_unsafe_channel_names(admin):
+    """渠道名要进 Redis 键 ⇒ 必须按白名单收口（治理面不能变成"任意键的读写把手"）。"""
+    for bad in ("Echo", "up;flushall", "a/../../x", "{tag}", "", "a" * 80):
+        response = await admin.get(f"/admin/channels/{bad}/pacing", headers=OPERATOR)
+        assert response.status_code in (400, 404), f"{bad!r} 竟被接受：{response.status_code}"

@@ -75,6 +75,12 @@ class PollingController(Protocol):
     async def note_clean_period(self, channel: str) -> float: ...
     async def decay_if_clean(self, channel: str, *, quiet_seconds: float) -> float | None: ...
     async def paused_for(self, channel: str) -> float: ...
+    #: 渠道自适应状态的**可观测与复位**（治理面用；2026-09-21 见 §3.19）
+    #: 命名用 ``current_multiplier`` 而不是 ``multiplier``：内存版把 ``multiplier`` 用作
+    #: 「渠道 → 乘子」的字典（既有用例与实现都依赖它），方法与属性同名会互相遮蔽。
+    async def current_multiplier(self, channel: str) -> float: ...
+    async def snapshot(self, channel: str) -> dict[str, object]: ...
+    async def reset(self, channel: str, *, include_samples: bool = False) -> dict[str, object]: ...
 
 
 class _BasePolling:
@@ -229,6 +235,50 @@ class RedisPollingController(_BasePolling):
         except (TypeError, ValueError):  # pragma: no cover - 脏数据兜底
             return AIMD_MIN
 
+    # ---- 治理面：状态查看与复位（§3.19）----
+    async def current_multiplier(self, channel: str) -> float:
+        return await self._multiplier(channel)
+
+    async def _samples(self, channel: str) -> int:
+        raw = await get_redis().hgetall(self._hist_key(channel))
+        return sum(int(v) for v in raw.values())
+
+    async def snapshot(self, channel: str) -> dict[str, object]:
+        """渠道自适应的**全量可观测状态**（不改任何东西）。"""
+        raw_rl = await get_redis().get(self._rl_key(channel))
+        try:
+            last: float | None = float(raw_rl) if raw_rl is not None else None
+        except (TypeError, ValueError):
+            last = None
+        samples = await self._samples(channel)
+        multiplier = await self._multiplier(channel)
+        return {
+            "channel": channel,
+            "multiplier": round(multiplier, 4),
+            "paused_for": round(await self.paused_for(channel), 3),
+            "last_rate_limited_at": last,
+            "samples": samples,
+            "warm": samples >= self.hot_start_samples,
+            "max_multiplier": round(self.maximum / max(self.base, 1e-6), 4),
+        }
+
+    async def reset(self, channel: str, *, include_samples: bool = False) -> dict[str, object]:
+        """复位渠道自适应状态（删键 ⇒ 乘子回 ``AIMD_MIN``、暂停位与 429 时间戳清空）。
+
+        ``include_samples`` 连同直方图与百分位缓存一起清（**会丢**自适应轮询的学习成果，
+        默认不清 —— 限流惩罚与时长学习是两件事，复位前者不必牺牲后者）。
+        """
+        client = get_redis()
+        before = await self.snapshot(channel)
+        await client.delete(self._aimd_key(channel))
+        await client.delete(self._pause_key(channel))
+        await client.delete(self._rl_key(channel))
+        if include_samples:
+            await client.delete(self._hist_key(channel))
+            await client.delete(self._pct_key(channel))
+        after = await self.snapshot(channel)
+        return {"before": before, "after": after, "include_samples": include_samples}
+
 
 class MemoryPollingController(_BasePolling):
     """内存版：同一套算法，供无 Redis 的测试与本地联调使用。"""
@@ -293,3 +343,32 @@ class MemoryPollingController(_BasePolling):
 
     async def paused_for(self, channel: str) -> float:
         return max(0.0, self.pause_until.get(channel, 0.0) - time.monotonic())
+
+    # ---- 治理面：状态查看与复位（§3.19；与 Redis 版同语义）----
+    async def current_multiplier(self, channel: str) -> float:
+        return float(self.multiplier.get(channel, AIMD_MIN))
+
+    async def snapshot(self, channel: str) -> dict[str, object]:
+        samples = sum(self.buckets.get(channel, {}).values())
+        # 内存版记的是 monotonic，为了让响应形状与 Redis 版一致（epoch 秒），这里换算一次
+        last_mono = self.last_rate_limited.get(channel)
+        last_wall = None if last_mono is None else time.time() - (time.monotonic() - last_mono)
+        return {
+            "channel": channel,
+            "multiplier": round(float(self.multiplier.get(channel, AIMD_MIN)), 4),
+            "paused_for": round(await self.paused_for(channel), 3),
+            "last_rate_limited_at": last_wall,
+            "samples": samples,
+            "warm": samples >= self.hot_start_samples,
+            "max_multiplier": round(self.maximum / max(self.base, 1e-6), 4),
+        }
+
+    async def reset(self, channel: str, *, include_samples: bool = False) -> dict[str, object]:
+        before = await self.snapshot(channel)
+        self.multiplier.pop(channel, None)
+        self.pause_until.pop(channel, None)
+        self.last_rate_limited.pop(channel, None)
+        if include_samples:
+            self.buckets.pop(channel, None)
+        after = await self.snapshot(channel)
+        return {"before": before, "after": after, "include_samples": include_samples}
