@@ -71,6 +71,9 @@ services:
     command: ["uvicorn", "async_gateway.gateway.app:app", "--host", "0.0.0.0", "--port", "8000"]
     environment:
       <<: *app-env
+      # 探针角色：镜像里的 HEALTHCHECK 是**角色感知**的（见 Dockerfile）。
+      # 不显式声明也能从 PID 1 的 cmdline 推断；这里写出来是给"换命令/换编排"的人一个把手。
+      AG_PROBE_ROLE: gateway
     ports: ["8000:8000"]
 
   worker:
@@ -78,6 +81,7 @@ services:
     command: ["python", "-m", "async_gateway.workers.worker", "--pools", "heavy-poll,light-poll"]
     environment:
       <<: *app-env
+      AG_PROBE_ROLE: worker
     deploy:
       replicas: 2
 
@@ -86,6 +90,7 @@ services:
     command: ["python", "-m", "async_gateway.workers.worker", "--pools", "transfer"]
     environment:
       <<: *app-env
+      AG_PROBE_ROLE: worker
 
   scheduler:
     <<: *app-build
@@ -93,6 +98,7 @@ services:
     command: ["python", "-m", "async_gateway.workers.scheduler"]
     environment:
       <<: *app-env
+      AG_PROBE_ROLE: scheduler
     deploy:
       replicas: 1
 
@@ -102,6 +108,7 @@ services:
     command: ["python", "-m", "async_gateway.workers.inspector"]
     environment:
       <<: *app-env
+      AG_PROBE_ROLE: inspector
     deploy:
       replicas: 1
 
@@ -110,6 +117,7 @@ services:
     command: ["uvicorn", "async_gateway.admin.app:app", "--host", "0.0.0.0", "--port", "8080"]
     environment:
       <<: *app-env
+      AG_PROBE_ROLE: admin
     ports: ["8080:8080"]
 
 volumes:

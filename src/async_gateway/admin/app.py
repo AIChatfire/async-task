@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 from ..config import get_settings
 from ..db.audit import AuditEventType, AuditWriter, _digest
+from ..db.base import healthy as db_healthy
 from ..db.base import session_scope
 from ..db.dao import TaskDAO
 from ..db.models import AsyncTask
@@ -37,6 +38,7 @@ from ..domain.state_machine import is_business_terminal
 from ..gateway.container import get_container
 from ..gateway.idempotency import attempt_of, retry_key
 from ..infra.credentials import credential_ttl_seconds
+from ..infra.redis import ping as redis_ping
 from ..infra.request_store import body_ttl_seconds, request_key
 from ..observability.logging import configure_logging
 from ..observability.metrics import GOVERNANCE_TOTAL, REGISTRY, render_metrics
@@ -899,7 +901,33 @@ async def metrics(actor: Actor = Depends(require(*ALL_ROLES))) -> PlainTextRespo
 
 @router.get("/healthz", include_in_schema=False)
 async def healthz() -> dict[str, str]:
+    """治理面健康检查（带 ``/admin`` 前缀的历史路径，保留兼容）。"""
     return {"status": "ok"}
+
+
+# ---- 根路径探针（2026-09-21 补，livetest-ai 报告 E2E-ASYNC-TASK-001 的 F3）----
+# 原状：治理面只挂 ``/admin/*`` ⇒ 根路径 ``/healthz`` / ``/livez`` / ``/readyz`` 全 404。
+# 后果：照搬数据面的探针路径（``127.0.0.1:<port>/healthz``）会得到**假的"服务不健康"**——
+# 运维要么把服务判死，要么被迫把探针指向 ``/openapi.json`` 这种与健康无关的路径。
+# 口径与数据面（``gateway/app.py``）保持一致，避免两套探针语义。
+root_router = APIRouter(include_in_schema=False)
+
+
+@root_router.get("/healthz")
+@root_router.get("/livez")
+async def root_livez() -> dict[str, str]:
+    """存活：进程能应答即 ok（不查依赖）。"""
+    return {"status": "ok"}
+
+
+@root_router.get("/readyz")
+async def root_readyz() -> JSONResponse:
+    """就绪：治理面读 PG（模板库/审计/审批单）与 Redis（重放限流）才算就绪。"""
+    db_ok = await db_healthy()
+    cache_ok = await redis_ping()
+    return JSONResponse(
+        status_code=200 if db_ok else 503, content={"db": db_ok, "cache": cache_ok}
+    )
 
 
 def create_admin_app() -> FastAPI:
@@ -911,6 +939,7 @@ def create_admin_app() -> FastAPI:
         docs_url="/docs",
         redoc_url=None,
     )
+    app.include_router(root_router)
     app.include_router(router)
     return app
 
@@ -918,4 +947,4 @@ def create_admin_app() -> FastAPI:
 app = create_admin_app()
 
 
-__all__ = ["ApprovalStore", "Actor", "app", "create_admin_app", "router"]
+__all__ = ["ApprovalStore", "Actor", "app", "create_admin_app", "root_router", "router"]

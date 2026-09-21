@@ -24,6 +24,7 @@ from ..bus.factory import make_bus
 from ..config import get_settings
 from ..db.base import dispose_engine
 from ..infra.redis import close_redis
+from ..observability.heartbeat import beat
 from ..observability.logging import configure_logging
 from ..observability.metrics import ENQUEUE_LAG, REGISTRY
 from ..tasks.handlers import dispatch_message
@@ -95,11 +96,16 @@ async def run_worker(pools: Sequence[str], consumer: str | None = None, *, stop_
     while not stop.is_set():
         ticks += 1
         WORKER_HEARTBEAT.set(asyncio.get_running_loop().time())
+        # 进程级心跳（供容器探针判活，见 observability/heartbeat.py）：
+        # 每轮循环 + 每条消息处理前各打一次 —— 单条消息最长可占到 handler 超时，
+        # 只在循环头打点会让忙时的 worker 被自己的探针误判（阈值默认 120s）。
+        beat("worker")
         progressed = False
         for queue in queues:
             messages = await bus.consume(queue, consumer=consumer, count=10, block_ms=200)
             for message in messages:
                 progressed = True
+                beat("worker")
                 started = message.enqueued_at.timestamp()
                 try:
                     await dispatch_message(message.payload, message.name, bus, container)

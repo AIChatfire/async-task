@@ -62,7 +62,15 @@ def _decremented_attempts():
     """
     return case(((AsyncTask.attempts - 1) > 0, AsyncTask.attempts - 1), else_=0)
 
-#: 状态 → 该派发什么任务（scheduler 用；accepted 不在其中，由 inspector 巡检重投）
+#: 状态 → 该派发什么任务（scheduler 用）。
+#:
+#: ``accepted`` **不在**这张表里，但它另有**一条受控入口**（见 :meth:`TaskDAO.due_for_dispatch`）：
+#: ``submit_started_at IS NULL``（无在途提交意图）且 ``next_poll_at`` 到期 ⇒ 派发 ``submit_upstream``。
+#: 这条入口服务的是"**明知何时该重投**"的场景——上游 429 / 401/403 走
+#: ``release_submit_intent`` 回到 accepted 时已经写好了 ``next_poll_at``（含 Retry-After 与退避）。
+#: 2026-09-21 之前 accepted 一律只由 inspector 的悬挂巡检重投（门槛 60s + tick 15s），
+#: 实测把"配置里 3s 的重试意图"放大成 60-90s（livetest-ai 报告 E2E-ASYNC-TASK-001 §3.4）。
+#: **有**提交意图的 accepted 仍然只走 inspector 分流（禁止未经确认重投——那是唯一防重复创建的闸门）。
 DISPATCH_BY_STATUS: dict[TaskStatus, str] = {
     TaskStatus.UPSTREAM_SUBMITTED: "poll_upstream",
     TaskStatus.IN_PROGRESS: "poll_upstream",
@@ -70,6 +78,9 @@ DISPATCH_BY_STATUS: dict[TaskStatus, str] = {
     TaskStatus.SUBMIT_UNKNOWN: "compensate_orphan",
     TaskStatus.FAILED: "submit_upstream",  # 失败重试 = 新业务尝试，经 submit_upstream 重建
 }
+
+#: accepted 且无在途提交意图时的派发目标（与 ``FAILED`` 同一条 handler，只是前置条件更严）
+ACCEPTED_RESUBMIT_HANDLER = "submit_upstream"
 
 #: 写路径名 → 允许的前置状态（与 state_machine.WRITE_PATHS 保持一致）
 CANCEL_PRECONDITIONS: frozenset[TaskStatus] = frozenset(
@@ -381,11 +392,26 @@ class TaskDAO:
 
     # ---------------- 查询（scheduler / inspector）----------------
     async def due_for_dispatch(self, *, limit: int = 500, now: datetime | None = None) -> Sequence[AsyncTask]:
+        """到期该派发的任务：``next_poll_at`` 已到 + 状态属于可派发集合。
+
+        可派发集合 = :data:`DISPATCH_BY_STATUS` ∪ 「``accepted`` 且**无在途提交意图**」。
+        后者的安全性由 ``submit_started_at IS NULL`` 保证：意图（``mark_submit_intent``）
+        是调上游**之前**打的 CAS 标记，为空即"上游侧一定没有本任务的创建请求在途"，
+        此时重投与 inspector 悬挂巡检的"无意图 → 条件更新重投"是同一个判定，只是
+        **不必再等悬挂门槛**（详见 :data:`DISPATCH_BY_STATUS` 的注释与
+        ``docs/IMPLEMENTATION.md`` §3.17）。
+        """
         now = now or now_utc()
         stmt: Select = (
             select(AsyncTask)
             .where(
-                AsyncTask.status.in_([s.value for s in DISPATCH_BY_STATUS]),
+                or_(
+                    AsyncTask.status.in_([s.value for s in DISPATCH_BY_STATUS]),
+                    and_(
+                        AsyncTask.status == TaskStatus.ACCEPTED.value,
+                        AsyncTask.submit_started_at.is_(None),
+                    ),
+                ),
                 AsyncTask.next_poll_at.is_not(None),
                 AsyncTask.next_poll_at <= now,
             )

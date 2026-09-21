@@ -6,7 +6,12 @@
 * 崩溃恢复后按 ``next_poll_at`` **分批放出**（每 tick 至多 ``scheduler_batch_size`` 条，
   且按时间升序），避免积压洪峰一次性砸向上游；
 * 派发后写一个**派发租约**（把 ``next_poll_at`` 向前推），防止同一条任务在本 tick
-  被反复派发；handler 若已把时间轴推得更远，租约 CAS 自然失败、不覆盖。
+  被反复派发；handler 若已把时间轴推得更远，租约 CAS 自然失败、不覆盖；
+* 派发集合除 ``DISPATCH_BY_STATUS`` 外，还含「``accepted`` **且无在途提交意图**」——
+  这是 429 / 401/403 释放提交意图后的**准时重投**入口（``next_poll_at`` 由 handler 按
+  Retry-After 与退避写好）。旧口径下 accepted 只由 inspector 的 60s 悬挂门槛兜底，
+  实测把配置里 3s 的重试意图放大成 60-90s（见 ``docs/IMPLEMENTATION.md`` §3.17）。
+  **有**意图的 accepted 仍不派发（可能已调上游未落库，只能走 compensate 确认）。
 """
 
 from __future__ import annotations
@@ -20,11 +25,12 @@ import time
 from ..bus.factory import make_bus
 from ..config import get_settings
 from ..db.base import dispose_engine, session_scope
-from ..db.dao import DISPATCH_BY_STATUS, TaskDAO
+from ..db.dao import ACCEPTED_RESUBMIT_HANDLER, DISPATCH_BY_STATUS, TaskDAO
 from ..domain.enums import TaskStatus
 from ..infra.redis import close_redis
+from ..observability.heartbeat import beat
 from ..observability.logging import configure_logging
-from ..observability.metrics import QUEUE_DEPTH, REGISTRY, TASK_AGE
+from ..observability.metrics import ACCEPTED_RESUBMIT_TOTAL, QUEUE_DEPTH, REGISTRY, TASK_AGE
 from ..tasks.queues import poll_queue
 
 logger = logging.getLogger(__name__)
@@ -36,6 +42,11 @@ DISPATCH_TOTAL = REGISTRY.counter("ag_scheduler_dispatch_total", "scheduler 派�
 def target_queue_and_name(task) -> tuple[str, str] | None:
     status = TaskStatus(task.status)
     name = DISPATCH_BY_STATUS.get(status)
+    if name is None and status is TaskStatus.ACCEPTED and task.submit_started_at is None:
+        # accepted 的重投入口（受控）：无在途提交意图 ⇒ 上游侧必无本任务的创建请求在途
+        # ⇒ 与 inspector 悬挂巡检同判定，但按 next_poll_at 准时发出（不必等 60s 门槛）。
+        # 有意图的 accepted 仍返回 None（交给 inspector 分流，禁止未确认重投）。
+        name = ACCEPTED_RESUBMIT_HANDLER
     if name is None:
         return None
     if name == "poll_upstream":
@@ -76,6 +87,8 @@ async def dispatch_due(bus, *, batch_size: int | None = None, lease_seconds: flo
                 continue
             await bus.enqueue(queue, name, {"task_id": task.task_id})
             DISPATCH_TOTAL.inc({"name": name, "queue": queue})
+            if TaskStatus(task.status) is TaskStatus.ACCEPTED:
+                ACCEPTED_RESUBMIT_TOTAL.inc({"channel": task.channel})
             dispatched += 1
     return dispatched
 
@@ -108,6 +121,8 @@ async def run_scheduler(*, max_ticks: int | None = None, tick_seconds: float | N
         try:
             count = await dispatch_due(bus)
             SCHEDULER_HEARTBEAT.set(time.time())
+            # 进程级心跳（容器探针判活；见 observability/heartbeat.py）
+            beat("scheduler")
             if ticks % 10 == 0:
                 await publish_queue_metrics(bus)
             if count:

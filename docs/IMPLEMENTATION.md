@@ -335,6 +335,60 @@ compose 部署（生产为 K8s）。
 **未验证**：本机**无 Docker** ⇒ 精简后的 compose 只做静态断言（`test_env_contract` 的 yaml 解析）；
 Redis 请求存储的真实链路（多进程 create body 交付）需在容器/真机上复验。
 
+### 3.17 按 livetest-ai 报告做了四件优化（2026-09-21，v0.0.4）
+
+依据：`livetest-ai` 最新报告 `20260921T181320-E2E-ASYNC-TASK-001-18033b`（v0.0.3，25/25 通过）
+的**发现表**与文档 `docs/async-task-部署与测试流程.md` §3.4/§3.5/§6「遗留与建议（给被测项目）」。
+25/25 全绿不等于没事可做——报告里"未通过项 = 0"同时把四件事留在台面上：
+
+1. **F2（medium）镜像探针按进程给**。原状：镜像 HEALTHCHECK 恒探 `127.0.0.1:8000/healthz`
+   ⇒ worker / scheduler / inspector / transfer-worker **恒为 unhealthy**（它们不在 8000 上监听），
+   部署侧只能给这四个服务各自声明探针才 healthy——产品缺陷被部署绕开，运维拿到的红是噪音。
+   落地：探针改为**角色感知**（`scripts/healthcheck.py`）——web 角色（gateway/admin）走 HTTP；
+   循环角色走**心跳文件新鲜度**（`observability/heartbeat.py`：每轮循环 touch
+   `{AG_HEARTBEAT_DIR}/{role}.beat`）。角色来源 `--role` > `AG_PROBE_ROLE` > PID 1 cmdline 推断
+   （默认 CMD 零配置可用）。判据是"**循环还在推进**"而不是"容器还在"：卡住的循环会被判死。
+   阈值 `AG_PROBE_MAX_AGE_SECONDS`（默认 120s）**必须大于最长单条消息处理时长**
+   （`AG_SUBMIT_READ_TIMEOUT × 3 = 90s`），否则忙时的 worker 会被自己的探针判死——所以
+   worker 在**每条消息处理前**也打一次心跳。探针**禁用代理**
+   （`ProxyHandler({})`）：探回环的请求被 `HTTP_PROXY` 代理走会拿到 502，把"进程没起来"误报成"网关故障"。
+
+2. **F3（low）治理面补根路径探针**。原状：`/healthz` / `/livez` / `/readyz` 全 404（只有
+   `/admin/healthz`），部署侧被迫把探针指向 `/openapi.json`——与健康无关的路径。
+   落地：`admin/app.py` 增根路径 `/healthz`、`/livez`（存活）与 `/readyz`（就绪 = PG 可达；
+   Redis 状态同报但**不参与**判死，与数据面口径一致），`/admin/healthz` 保留兼容。
+
+3. **查询面透传刷新：无上游 id 时显式跳过 + 失败可诊断**（报告文档 §3.5）。
+   原状：预创建期（`queued` 受理后、后台 create 落库前）查询仍构造一次透传 GET，空 id 被净化层
+   拒绝（"插值变量 id 为空"）⇒ 请求根本没出门，异常又被查询面 `except Exception: pass` 吞掉：
+   白做一次构造、不留任何痕迹。落地：无 `upstream_task_id` 时**显式跳过**并计数
+   `ag_query_refresh_total{result="skipped_no_upstream_id"}`；刷新不成功（异常 / 上游非 2xx）
+   分别记 `error` / `upstream_not_ok` 并对异常分支打日志（含 task_id 与异常类型）。查询响应形状不变。
+
+4. **`accepted` 重投时延：60–90s → 一个调度 tick**（报告文档 §3.4，观察项）。
+   原状：429 / 401/403 走 `release_submit_intent` 回到 `accepted` 并写好 `next_poll_at`
+   （Retry-After 与退避），但 `accepted` **不在调度派发集合**里，重投只能等 inspector 的悬挂巡检
+   （`accepted_stall_seconds=60` + tick 15s）⇒ 实测把配置里 3s 的重试意图放大到 60–90s。
+   落地：`due_for_dispatch` 增加受控入口——「`accepted` **且 `submit_started_at IS NULL`**」且到期
+   即派发 `submit_upstream`；**有**在途提交意图的 `accepted` 仍只由 inspector 分流
+   （转 `submit_unknown` 走 compensate），那是防止重复创建的唯一闸门，未放宽。
+   安全依据：意图是调上游**之前**打的 CAS 标记，为空 ⇒ 上游侧必无本任务的创建请求在途，
+   与 inspector"无意图 → 条件更新重投"是同一判定。
+
+配置面：新增两项（`.env.example` 已登记，`AG_` 前缀）：`AG_HEARTBEAT_DIR`（默认 `/tmp/ag-heartbeat`）、
+`AG_PROBE_MAX_AGE_SECONDS`（默认 120s）。二者由 `observability/heartbeat.py` **直接读环境变量**
+（探针要能在不加载 Settings 的最小环境里跑），`Settings` 侧同名字段保证它们在权威清单里可见、可校验。
+
+守卫测试：`tests/test_health_probe.py`（角色判定 / 心跳缺失过期必红 / HTTP 判据 / Dockerfile 与
+compose 接线 / 三个循环**行为验证**都打心跳）、`tests/test_admin.py`（根路径探针 + `readyz` 判死）、
+`tests/test_submit_mode.py`（预创建期零刷新调用 + 刷新失败计数）、
+`tests/test_handlers.py`（429 重投**在一次调度 tick 内**发出，且当时 inspector 还看不到该任务 +
+有意图者绝不被派发）。
+
+**未验证（同上：本机无 Docker）**：镜像 HEALTHCHECK 与 compose 的 `AG_PROBE_ROLE` 接线只做
+**静态断言**；"四个非 web 容器变 healthy"需在 livetest-ai 的下一轮部署里复验（它们可**去掉**
+部署侧的探针覆盖，改由镜像自带探针判定）。
+
 ---
 
 ## 4. 未验证 / 待确认（评估可用性前必读）
@@ -345,7 +399,7 @@ Redis 请求存储的真实链路（多进程 create body 交付）需在容器/
 |---|---|
 | **Postgres** | 本机没有。全部测试跑 SQLite。`alembic/versions/0001_initial.py` 未执行过；`scripts/partition_async_task.sql`（月度分区 + DETACH 归档）**未执行**，是按文档产出的运维工件，必须先在 PG 上演练 |
 | **MinIO / 对象存储** | ✅ 2026-09-20 已连真机并跑通 **store 端到端**（`oss.s3ai.cn` / 桶 `cdn`）：真实转存 42.4 MB 产物 → `result_ref=20260920/{tenant}/{task_id}/attempt-1.bin` → 查询响应里结果字段 = 该对象的**预签名 URL** → `Range` 取回 **HTTP 206**；另改为**不自动建桶**（见 `test_minio_store_does_not_auto_create_bucket`）。🔻**桶读权限已确认保持公开**（`Principal:*` 的 `s3:GetObject` + `s3:ListBucket`）⇒ 转存产物属**公开资源、且可被枚举**，此为**有意取舍**（勿放敏感产物）。SSE-S3 桶加密、留存到期清理仍未接线 |
-| **Docker / K8s** | 本机无 docker CLI，`docker compose up` 未跑过；`Dockerfile` 尚未补（compose 已引用）。HPA 复合指标、探针、单副本约束都只是配置声明 |
+| **Docker / K8s** | 本机无 docker CLI，`docker compose up` 未跑过。`Dockerfile` 已有（构建由 CI 承担），探针**按进程给**（角色感知，2026-09-21 修 F2，见 §3.17）但只做静态断言。HPA 复合指标、K8s 单副本约束仍只是配置声明 |
 | **Logfire** | 未配 token；`logfire.configure` 分支未执行。指标走内置注册表 + `/metrics`（Prometheus 文本格式），未接真实采集 |
 | **真实上游（火山方舟）** | ✅ 2026-09-20 已**完整端到端**验证：`doubao-seed3d-2-0-260328` 图生 3D 经网关跑通两次（端到端 4m38s / 4m48s）——受理原生形状 → 轮询 → 终态 → 结果字段（含签名）→ 直链抽检 `HTTP 206` / 42.4 MB 可取，当前默认 `passthrough`。脚本 `scripts/live_seed3d.py`，记录见 `docs/newapi-task-plugin-integration.md` §8。**其余上游（Seedance 视频等）仍未真机跑过**；`store`（转存）路径的真机验证只有一次（见 §3.11），且对象存储未连真机 |
 | **New API 侧** | 完全没有联调。§16 的"状态输出契约"只在网关侧自证（原生形状、内部终态重写、结果字段重写都已测），**M3 出口要求的"New API adaptor 对转存永久失败形状不误判为 failed"未验证** |
@@ -401,7 +455,8 @@ Redis 请求存储的真实链路（多进程 create body 交付）需在容器/
 1. **起一台真 PG + MinIO**，跑 `alembic upgrade head`，演练分区脚本，补 M3 故障注入清单（7 项）。
 2. **New API 侧联调**（M3 出口）：重点是 §4.2 的"转存永久失败报 succeeded"形状与内部终态重写形状。
 3. **M3 性能基线压测**：单 scheduler 上限、Streams 吞吐、热表 UPDATE 速率（当前 §17 全是目标值）。
-4. 补 `Dockerfile` 与探针/HPA 清单，跑通 `docker compose up`。
+4. 补 HPA 清单与 K8s 探针声明（镜像探针已角色感知，见 §3.17；exec 探针可直接复用
+   `scripts/healthcheck.py --role <角色>`），并在真机上跑通 `docker compose up`。
 5. 补 `list_and_match`、每日对账任务、留存到期清理任务。
 6. 补 AI 生成流水线（LLM 调用 + 文档注入防护实测）。
 

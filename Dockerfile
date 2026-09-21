@@ -32,8 +32,14 @@ USER app
 
 EXPOSE 8000
 
-# slim 镜像没有 curl，用 Python 做探针
-HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=5 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status==200 else 1)"
+# 健康探针（**角色感知**，2026-09-21 修 F2）：
+#   镜像原先只会探 127.0.0.1:8000/healthz —— 那是**默认 CMD**（gateway-api）的路径。
+#   worker / scheduler / inspector / transfer-worker 不在 8000 上监听，于是恒为 unhealthy
+#   （livetest-ai 报告 E2E-ASYNC-TASK-001 的 F2：探的不是自己的进程）。
+#   现在探针自己判角色：web 角色走 HTTP；循环角色比对「循环心跳文件」的新鲜度
+#   （见 src/async_gateway/observability/heartbeat.py）。
+#   角色来源：AG_PROBE_ROLE 环境变量 > 从 PID 1 的 cmdline 推断（默认 CMD 无需声明）。
+#   阈值/目录：AG_PROBE_MAX_AGE_SECONDS（默认 120s）/ AG_HEARTBEAT_DIR（默认 /tmp/ag-heartbeat）。
+HEALTHCHECK --interval=15s --timeout=3s --start-period=15s --retries=5 CMD ["python", "/app/scripts/healthcheck.py"]
 
 CMD ["uvicorn", "async_gateway.gateway.app:app", "--host", "0.0.0.0", "--port", "8000"]

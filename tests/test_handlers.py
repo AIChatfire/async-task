@@ -534,3 +534,59 @@ async def test_transfer_auto_disabled_when_store_unconfigured(
         assert body["data"]["output"]["url"].startswith(fake_upstream.base_url)
     finally:
         set_result_store(MemoryResultStore())
+
+
+# ---------------------------------------------------------------- accepted 重投时延（§3.4）
+async def test_rate_limited_task_is_resubmitted_on_next_scheduler_tick(
+    client, container, fake_upstream, db
+):
+    """429 释放提交意图后回 accepted：重投由 scheduler 按 next_poll_at 派发，**不等 60s 门槛**。
+
+    对应 livetest-ai 报告 E2E-ASYNC-TASK-001 §3.4：旧口径把"配置里 3s 的重试意图"
+    放大成 60-90s（``accepted_stall_seconds=60`` + inspector tick 15s）。
+    判别点写死在这里：重投发生时，**inspector 的悬挂巡检还看不到这条任务**。
+    """
+    fake_upstream.queue_create("rate_limited")
+    created = await client.post("/async/echo/v1/tasks", json={"prompt": "rl"}, headers=AUTH)
+    task_id = created.headers["x-ag-task-id"]
+    task = await get_task(task_id)
+
+    # 429 的落库形状：回 accepted、意图已释放（可安全重投）、退避写在 next_poll_at
+    assert task.status == TaskStatus.ACCEPTED.value
+    assert task.submit_started_at is None
+    assert task.next_poll_at is not None
+    assert task.attempts == 0  # 429 不消耗业务 attempts
+    # 退避是"秒级"而不是被悬挂门槛（60s）绑住
+    delay = (task.next_poll_at - _now()).total_seconds()
+    assert delay <= 5.0, f"429 退避应≤5s（Retry-After/轮询间隔），实得 {delay}s"
+
+    # 把时间轴推到"已到期"（等价于等了一个退避周期，不真睡）
+    async with session_scope() as s:
+        dao = TaskDAO(s)
+        assert await dao.schedule_next_poll(task_id, _now() - timedelta(seconds=1))
+        # 判别点：此刻 inspector 的悬挂巡检**看不到**它（刚更新过，远未到 60s）
+        assert list(await dao.stalled_accepted(stall_seconds=60)) == []
+
+    dispatched = await dispatch_due(container.bus, batch_size=10, lease_seconds=60)
+    assert dispatched == 1
+    assert await container.bus.depth("submit:default") == 1
+
+    # 重投消息跑完 → 上游第二次 create（上一次是 429）
+    await drain(container.bus, "submit:default", container)
+    assert fake_upstream.create_calls == 2
+    task = await get_task(task_id)
+    assert task.upstream_task_id is not None
+
+
+async def test_accepted_with_submit_intent_is_never_dispatched_by_scheduler(
+    container, fake_upstream, db
+):
+    """有在途提交意图的 accepted 绝不派发 —— 那是唯一可能重复创建的窗口。"""
+    await make_task(
+        status=TaskStatus.ACCEPTED.value,
+        submit_started_at=_now(),
+        attempts=1,
+        next_poll_at=_now() - timedelta(seconds=1),
+    )
+    assert await dispatch_due(container.bus, batch_size=10, lease_seconds=60) == 0
+    assert await container.bus.depth("submit:default") == 0

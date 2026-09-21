@@ -28,6 +28,7 @@ from ..db.base import dispose_engine, session_scope
 from ..db.dao import TaskDAO
 from ..domain.enums import ErrorCode, TaskStatus
 from ..infra.redis import close_redis
+from ..observability.heartbeat import beat
 from ..observability.logging import configure_logging
 from ..observability.metrics import ACTIVE_TASKS, REGISTRY, TASK_TERMINAL_TOTAL, UNKNOWN_GAUGE
 from ..gateway.container import get_container
@@ -251,6 +252,9 @@ async def run_inspector(*, max_ticks: int | None = None, tick_seconds: float | N
                 logger.info("inspector tick %s", summary)
         except Exception as exc:  # noqa: BLE001 - 巡检单 tick 失败不能退出
             logger.exception("inspector tick failed: %s", exc)
+        # 进程级心跳（容器探针判活；见 observability/heartbeat.py）。
+        # 放在 except 之后：失败的 tick 也算"循环还在推进"，探针失败率由指标/日志表达。
+        beat("inspector")
         if max_ticks is not None and ticks >= max_ticks:
             break
         await asyncio.sleep(interval)

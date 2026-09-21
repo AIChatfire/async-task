@@ -161,6 +161,13 @@ TASK_AGE = REGISTRY.gauge("ag_oldest_queue_message_age_seconds", "队列最老�
 ACTIVE_TASKS = REGISTRY.gauge("ag_active_tasks", "活动任务数（按渠道）")
 UNKNOWN_GAUGE = REGISTRY.gauge("ag_unknown_tasks", "unknown 任务数（按渠道与状态）")
 DEAD_TOTAL = REGISTRY.counter("ag_dead_total", "死信速率")
+QUERY_REFRESH_TOTAL = REGISTRY.counter(
+    "ag_query_refresh_total",
+    "查询面透传刷新结果分布（ok / upstream_not_ok / error / skipped_*）",
+)
+ACCEPTED_RESUBMIT_TOTAL = REGISTRY.counter(
+    "ag_accepted_resubmit_dispatch_total", "accepted 安全重投的派发数（无提交意图且到期）"
+)
 ENQUEUE_LAG = REGISTRY.histogram("ag_enqueue_lag_seconds", "消息从入队到被消费的时延")
 TASK_E2E_LATENCY = REGISTRY.histogram("ag_task_e2e_latency_seconds", "任务端到端时延")
 STORAGE_BYTES = REGISTRY.gauge("ag_result_storage_bytes", "结果存储用量估算")

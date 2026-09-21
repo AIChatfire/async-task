@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
@@ -44,6 +45,8 @@ from .routing import match_route
 
 router = APIRouter()
 callbacks = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 IDEMPOTENCY_HEADERS = ("idempotency-key", "x-ag-idempotency-key")
 ENVELOPE_HEADER = "x-ag-envelope"
@@ -212,7 +215,14 @@ async def _handle_query(
     container.assert_owned(task, auth)
 
     status = TaskStatus(task.status)
-    if not is_business_terminal(status) and auth.bearer:
+    if not is_business_terminal(status) and auth.bearer and task.upstream_task_id is None:
+        # 预创建期（``queued`` 受理后、后台 create 落库前）：**没有上游 id 就没有合法的刷新请求**。
+        # 旧实现照样发一次：透传 GET 的插值变量 id 为空 → 净化层拒绝（"插值变量 id 为空"）
+        # → 请求根本没出门，异常又被 ``except Exception: pass`` 吞掉 —— 白做一次构造、
+        # 且不留任何痕迹（livetest-ai 报告 E2E-ASYNC-TASK-001 §3.5 的实测结论）。
+        # 现在显式跳过并计数；占位状态由 output 层合成，语义不变。
+        M.QUERY_REFRESH_TOTAL.inc({"result": "skipped_no_upstream_id"})
+    elif not is_business_terminal(status) and auth.bearer:
         stale = (
             task.status_snapshot is None
             or task.status_snapshot_at is None
@@ -228,8 +238,18 @@ async def _handle_query(
                     await _handle_poll_result(ctx, rt, task, template, strategy, result)
                     refreshed = await _reload(task.task_id)
                     task = refreshed or task
-            except Exception:  # noqa: BLE001 - 上游抖动不能拖垮查询面
-                pass
+                M.QUERY_REFRESH_TOTAL.inc({"result": "ok" if result.ok else "upstream_not_ok"})
+            except Exception as exc:  # noqa: BLE001 - 上游抖动不能拖垮查询面
+                # 不再静默：失败率进指标、失败原因进日志（含异常类型 + 任务 id），
+                # 让"刷新为什么没生效"可诊断，而不是只剩一个空白的 pass。
+                M.QUERY_REFRESH_TOTAL.inc({"result": "error"})
+                logger.warning(
+                    "query refresh failed task_id=%s upstream_id=%s err=%s: %s",
+                    task.task_id,
+                    task.upstream_task_id,
+                    type(exc).__name__,
+                    exc,
+                )
 
     # store 模式下由 result_ref 直接换出对象存储的预签名 URL（§12.2 首选，不经网关中转）
     result_url = await _presigned_result_url(container, task, template)

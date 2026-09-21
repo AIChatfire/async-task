@@ -134,3 +134,60 @@ async def test_cancel_by_gateway_task_id(queued, client, container, fake_upstrea
     assert task.status == TaskStatus.CANCELLED.value
     # 未创建即取消：上游从头到尾没被创建过
     assert fake_upstream.create_calls == 0
+
+
+def _counter_value(counter, labels: dict[str, str]) -> float:
+    return counter.samples.get(tuple(sorted(labels.items())), 0.0)
+
+
+async def test_query_before_submit_skips_passthrough_refresh(queued, client, fake_upstream, db):
+    """预创建期查询**显式跳过**透传刷新，且对上游零请求（livetest-ai 报告 §3.5）。
+
+    旧行为：任务还没有上游 id 时照样构造一次透传 GET —— 空 id 被净化层拒绝
+    （"插值变量 id 为空"），请求根本没发出，异常又被查询面的 ``except Exception: pass``
+    吞掉：既不产生价值，也不留任何痕迹（报告称"净化层拒绝 + 吞异常兜底"）。
+
+    守两点：
+    * 命中 ``skipped_no_upstream_id`` 计数（说明走的是"显式跳过"这条新路径）；
+    * 期间 ``error`` 样本零增长（说明**没有**再去做那次注定失败的构造）。
+    """
+    from async_gateway.observability import metrics as M
+
+    skipped_before = _counter_value(M.QUERY_REFRESH_TOTAL, {"result": "skipped_no_upstream_id"})
+    error_before = _counter_value(M.QUERY_REFRESH_TOTAL, {"result": "error"})
+
+    created = await _create(client)
+    task_id = created.headers["x-ag-task-id"]
+    for _ in range(4):  # 报告 T3c：预创建期连续 4 次查询
+        response = await client.get(f"/async/echo/v1/tasks/{task_id}", headers=AUTH)
+        assert response.status_code == 200
+        assert response.json()["status"] == "queued"  # 占位状态不受影响
+        assert response.headers["x-ag-snapshot"] == "cached"
+
+    skipped_after = _counter_value(M.QUERY_REFRESH_TOTAL, {"result": "skipped_no_upstream_id"})
+    error_after = _counter_value(M.QUERY_REFRESH_TOTAL, {"result": "error"})
+    assert skipped_after - skipped_before == 4, "预创建期查询应逐次命中「显式跳过」"
+    assert error_after == error_before, "不得再产生「构造空 id 请求 → 吞异常」的失败样本"
+    assert fake_upstream.request_log == [], "预创建期对上游必须零请求"
+
+
+async def test_query_refresh_failure_is_counted_not_swallowed(client, container, fake_upstream, db):
+    """刷新不成功不再静默：必须在指标里留痕（可诊断性）。
+
+    触发手段与真实故障同源：已提交的任务，上游对查询返回 5xx（``poll_script=http_500``）。
+    查询仍必须 200（刷新是尽力而为、失败不许拖垮查询面），但"没刷到"这件事必须可观测——
+    旧实现只在异常分支 ``pass``，成功与否都不留痕。
+    """
+    from async_gateway.observability import metrics as M
+
+    created = await _create(client, {"prompt": "refresh-fail"})
+    task_id = created.headers["x-ag-task-id"]
+    upstream_id = created.headers["x-ag-upstream-id"]
+    assert upstream_id
+
+    before = _counter_value(M.QUERY_REFRESH_TOTAL, {"result": "upstream_not_ok"})
+    fake_upstream.poll_script = ["http_500", "http_500", "http_500"]
+    response = await client.get(f"/async/echo/v1/tasks/{task_id}", headers=AUTH)
+    assert response.status_code == 200  # 上游抖动不能把查询面拖死
+    after = _counter_value(M.QUERY_REFRESH_TOTAL, {"result": "upstream_not_ok"})
+    assert after > before, "刷新未成功必须进指标（此前是静默的）"

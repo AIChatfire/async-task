@@ -365,3 +365,49 @@ async def test_admin_metrics_endpoint(admin):
     response = await admin.get("/admin/metrics", headers=OPERATOR)
     assert response.status_code == 200
     assert "ag_governance_total" in response.text or "ag_admin" in response.text
+
+
+# ------------------------------------------------------------------ 根路径探针（F3）
+async def test_admin_root_probes_exist_and_report_dependencies(admin, monkeypatch):
+    """治理面根路径必须有探针 —— 否则照搬数据面探针路径会把服务判成不健康。
+
+    对应 livetest-ai 报告 `E2E-ASYNC-TASK-001` 的 F3：``/healthz`` / ``/livez`` /
+    ``/readyz`` 全 404，部署侧只能把探针指向 ``/openapi.json``（与健康无关的路径）。
+    """
+    import importlib
+
+    module = importlib.import_module("async_gateway.admin.app")
+
+    # 探针不要求任何身份：不带 X-AG-Admin-Token 也必须是 200
+    live = await admin.get("/healthz")
+    assert live.status_code == 200, live.text
+    assert live.json() == {"status": "ok"}
+    assert (await admin.get("/livez")).status_code == 200
+    # 历史路径保留（老部署的探针指向 /admin/healthz）
+    assert (await admin.get("/admin/healthz")).status_code == 200
+
+    monkeypatch.setattr(module, "redis_ping", lambda: _async_true())
+    ready = await admin.get("/readyz")
+    assert ready.status_code == 200, ready.text
+    assert set(ready.json()) == {"db", "cache"}
+    assert ready.json()["db"] is True
+
+
+async def test_admin_readyz_is_503_when_database_is_down(admin, monkeypatch):
+    """就绪判据必须真的能判死：PG 不可达时 200 会让"就绪"变成永远为真。"""
+    import importlib
+
+    module = importlib.import_module("async_gateway.admin.app")
+    monkeypatch.setattr(module, "db_healthy", lambda: _async_false())
+    monkeypatch.setattr(module, "redis_ping", lambda: _async_true())
+    ready = await admin.get("/readyz")
+    assert ready.status_code == 503
+    assert ready.json() == {"db": False, "cache": True}
+
+
+async def _async_true() -> bool:
+    return True
+
+
+async def _async_false() -> bool:
+    return False

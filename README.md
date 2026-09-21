@@ -52,7 +52,7 @@ cp .env.example .env    # 然后按顶部清单逐条改；切勿提交 .env
 
 ```bash
 make install        # pip install -e ".[dev]"
-make test           # 209 项测试（SQLite + 内存 broker + MockTransport 假上游，无需 Redis）
+make test           # 233 项测试（SQLite + 内存 broker + MockTransport 假上游，无需 Redis）
 make test-all       # 追加 Redis 真机用例（Lua 原子性 / Streams 消费组 / AIMD 直方图）
 
 make gateway        # http://localhost:8000  （/docs 在非 prod 环境开放）
@@ -89,7 +89,29 @@ src/async_gateway/
 scripts/
   live_seed3d.py      真机联调：经网关跑一次图生 3D（含 New API 插件同口径路径）
   smoke_workers.py    后台进程冒烟（scheduler/inspector/worker 各一轮，走真实 Redis Streams）
+  healthcheck.py      容器健康探针（**角色感知**：web 走 HTTP，后台进程走循环心跳）
 ```
+
+## 健康探针（容器 HEALTHCHECK）
+
+探针是**角色感知**的（`scripts/healthcheck.py`），因为只有 web 进程开 HTTP 端口：
+
+| 角色 | 判据 |
+|---|---|
+| `gateway` / `admin` | `GET http://127.0.0.1:<port>/healthz` 期望 200（禁用代理，走回环直连） |
+| `worker` / `scheduler` / `inspector` | **循环心跳**：`{AG_HEARTBEAT_DIR}/{role}.beat` 的 mtime 新于 `AG_PROBE_MAX_AGE_SECONDS` |
+
+角色来源：`--role` > 环境变量 `AG_PROBE_ROLE` > **从 PID 1 的 cmdline 推断**（镜像默认 CMD 与
+`docker-compose.yml` 均无需额外声明也能判对）。心跳判的是"**循环还在推进**"而不是"容器还在"——
+卡住的循环会被判死并触发编排层重启。
+
+```bash
+# 在容器里手工跑一次（判据一行打印，docker inspect / kubectl describe 可见）
+python /app/scripts/healthcheck.py --role worker
+```
+
+⚠️ `AG_PROBE_MAX_AGE_SECONDS`（默认 120s）必须**大于最长单条消息处理时长**
+（`AG_SUBMIT_READ_TIMEOUT` × 3 = 90s），否则忙时的 worker 会被自己的探针判死。
 
 ## 设计上的几个硬约束
 

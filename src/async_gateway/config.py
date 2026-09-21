@@ -16,6 +16,8 @@ from typing import Literal
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .observability.heartbeat import DEFAULT_HEARTBEAT_DIR, DEFAULT_PROBE_MAX_AGE_SECONDS
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -139,6 +141,19 @@ class Settings(BaseSettings):
     scheduler_batch_size: int = 500
     inspector_tick_seconds: float = 15.0
     accepted_stall_seconds: int = 60
+
+    # ---- 探针 / 心跳（§19 探针；2026-09-21 修 F2：探针按进程给）----
+    #: 后台进程心跳目录：worker / scheduler / inspector 每轮循环 touch
+    #: ``{dir}/{role}.beat``，容器探针（``scripts/healthcheck.py``）比对 mtime 判活。
+    #:
+    #: 注意读取方式：**实际读取走 ``os.environ``**（:mod:`async_gateway.observability.heartbeat`），
+    #: 本字段与探针共用同一环境变量与同一默认值常量 —— 探针必须能在**不加载配置**的
+    #: 最小环境里跑起来（它是"配置坏了也要能报不健康"的那一层）。
+    heartbeat_dir: str = DEFAULT_HEARTBEAT_DIR
+    #: 心跳过期阈值（秒）：探针判定"循环卡住"的门槛。
+    #: 必须 > 最长单条消息处理时长（``AG_SUBMIT_READ_TIMEOUT`` × 3，默认 90s），
+    #: 否则忙时的 worker 会被自己的探针判死；默认 120s 留了余量。
+    probe_max_age_seconds: float = DEFAULT_PROBE_MAX_AGE_SECONDS
 
     @field_validator("ssrf_allow_hosts", "ssrf_allow_schemes", "url_direct_allowed_prefixes", mode="before")
     @classmethod
