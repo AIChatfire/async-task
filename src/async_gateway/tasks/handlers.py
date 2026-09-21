@@ -30,7 +30,13 @@ from ..domain.errors import backoff_seconds
 from ..domain.state_machine import BUSINESS_TERMINAL, is_business_terminal
 from ..gateway.container import Container, get_container
 from ..infra.credentials import get_credential_store
-from ..infra.object_store import get_result_store, request_key, result_key
+from ..infra.object_store import result_key
+from ..infra.request_store import (
+    RequestDataNotFound,
+    get_request_store,
+    response_key,
+    response_ttl_seconds,
+)
 from ..templates.render import render_cancel, render_create, render_get
 from ..templates.schema import ResultMode, ResolvedTemplate
 from ..templates.expression import try_extract
@@ -79,8 +85,14 @@ class HandlerContext:
         return get_credential_store()
 
     @property
+    def request_store(self):
+        """任务请求数据（create 请求体 / 响应存档）—— Redis 短生命周期存放。"""
+        return get_request_store()
+
+    @property
     def result_store(self):
-        return get_result_store()
+        """结果转存用的对象存储；**未配置时为 None**（转存自动关闭，调用方须判空）。"""
+        return self.container.result_store
 
     @property
     def settings(self):
@@ -107,17 +119,19 @@ class TaskRuntime:
         return tv.resolved, self.container.strategy_for(task.channel, tv)
 
     async def load_create_body(self, task: AsyncTask) -> dict[str, Any]:
-        if task.create_req_ref:
-            try:
-                import json
+        """从请求存储（Redis）重建 create 请求体。
 
-                raw = await self.ctx.result_store.get_bytes(task.create_req_ref)
-                body = json.loads(raw.decode())
-                if isinstance(body, dict):
-                    return body
-            except Exception:  # noqa: BLE001 - 摘要缺失时退回最小体，交给上游报错（不猜内容）
-                pass
-        return {}
+        读不到 = 基础设施事故（数据丢失 / 已过期）。**不猜内容**：把
+        :class:`RequestDataNotFound` 抛给调用方（提交路径显式失败），绝不拿空体去调上游 ——
+        空体只会被上游判成客户端的错（4xx），把基础设施事故伪装成用户错误。
+        """
+        if not task.create_req_ref:
+            return {}
+        import json
+
+        raw = await self.ctx.request_store.get_bytes(task.create_req_ref)
+        body = json.loads(raw.decode())
+        return body if isinstance(body, dict) else {}
 
     # ---- 凭证 ----
     async def credential(self, task: AsyncTask) -> str | None:
@@ -151,7 +165,11 @@ class TaskRuntime:
     async def finalize_success(self, task: AsyncTask, template: ResolvedTemplate) -> None:
         """成功收尾：转存入队 / 凭证清理 / 观测采样。"""
         await self.terminal_sample(task)
-        if template.result_policy.mode is ResultMode.STORE:
+        transferable = (
+            template.result_policy.mode is ResultMode.STORE
+            and self.ctx.container.result_store is not None
+        )
+        if transferable:
             await self.ctx.enqueue(TRANSFER_QUEUE, "store_result", attempt=1)
         await self.drop_credential(task)
         await _audit(
@@ -222,7 +240,18 @@ async def submit_upstream(ctx: HandlerContext) -> None:
         if not await _apply("mark_submit_intent", task.task_id):
             return
 
-        body = await rt.load_create_body(task)
+        try:
+            body = await rt.load_create_body(task)
+        except RequestDataNotFound:
+            # 请求体读不到（Redis 事故）：显式失败、不重试（重试也不会自己长回来）
+            if await _apply(
+                "advance", task.task_id, TaskStatus.DEAD, expected=expected,
+                error_code=ErrorCode.REQUEST_LOST.value,
+                error_message="create request body missing in request store",
+                retryable=False, finished_at=_now(), next_poll_at=None,
+            ):
+                await rt.finalize_terminal(task, TaskStatus.DEAD)
+            return
         callback_url = None
         if template.capabilities.callback and task.callback_token:
             callback_url = (
@@ -295,11 +324,10 @@ async def _handle_submit_result(
         # 回写 create 响应存档：后台提交成功后，幂等重放也必须拿到这份成功响应，
         # 而不是先前那次失败的响应（否则调用方会被旧错误永久挡住）。
         if result.response is not None:
-            from ..infra.object_store import create_response_key
-
-            await ctx.result_store.put_json(
-                create_response_key(task.tenant, task.task_id),
+            await ctx.request_store.put_json(
+                response_key(task.tenant, task.task_id),
                 {"status": result.response.status_code, "body": payload, "pending": False},
+                response_ttl_seconds(),
             )
         if task.cancel_requested:
             # submit 落库后强制检查 cancel_requested：杜绝"用户已取消、上游仍跑"
@@ -881,9 +909,13 @@ async def finalize_task(ctx: HandlerContext) -> None:
         return
     rt = TaskRuntime(ctx)
     template, _ = rt.template(task)
-    if TaskStatus(task.status) is TaskStatus.SUCCEEDED and template.result_policy.mode is ResultMode.STORE:
-        if task.result_ref is None:
-            await ctx.enqueue(TRANSFER_QUEUE, "store_result", attempt=1)
+    transferable = (
+        TaskStatus(task.status) is TaskStatus.SUCCEEDED
+        and template.result_policy.mode is ResultMode.STORE
+        and ctx.container.result_store is not None
+    )
+    if transferable and task.result_ref is None:
+        await ctx.enqueue(TRANSFER_QUEUE, "store_result", attempt=1)
     await rt.drop_credential(task)
 
 
@@ -896,6 +928,9 @@ async def store_result(ctx: HandlerContext) -> None:
         return
     if task.result_ref is not None:
         return  # 已有结果，重复投递无副作用
+    store = ctx.container.result_store
+    if store is None:
+        return  # 未配置对象存储 ⇒ 转存自动关闭（不派发、不重试、不告警）
     rt = TaskRuntime(ctx)
     template, _ = rt.template(task)
     if template.result_policy.mode is not ResultMode.STORE:
@@ -945,7 +980,7 @@ async def store_result(ctx: HandlerContext) -> None:
     key = result_key(
         task.tenant, task.task_id, created_at=task.created_at, attempt=1, ext="bin"
     )
-    await ctx.result_store.put_bytes(key, payload, "application/octet-stream")  # type: ignore[arg-type]
+    await store.put_bytes(key, payload, "application/octet-stream")  # type: ignore[arg-type]
     ok = await _apply(
         "set_result_ref", task.task_id,
         result_ref=key, summary={"bytes": len(payload)}, degraded=None,  # type: ignore[arg-type]
@@ -995,6 +1030,5 @@ __all__ = [
     "Origin",
     "UpstreamClient",
     "get_settings",
-    "request_key",
     "time",
 ]

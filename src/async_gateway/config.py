@@ -1,7 +1,10 @@
 """配置与策略组默认值（§12.2 策略组 / §4.3 配额 / §15 轮询 / §18 安全）。
 
-所有变量以 ``AG_`` 前缀注入，嵌套结构用双下划线。策略组的优先级：
-渠道覆盖(row) > 模板显式 > 本文件默认（见 :func:`load_strategy_defaults`）。
+配置项一律以 ``AG_`` 前缀注入，嵌套结构用双下划线。**前缀是刻意保留的**：部署环境常导出同名的
+通用变量（``DATABASE_URL`` / ``REDIS_URL`` / ``LOG_LEVEL`` 等），无前缀时它们会被**静默读到**
+并顶掉本文件默认值 —— 2026-09-21 一度按"精简"去掉前缀，同日复核确认该风险不可接受后恢复。
+
+策略组的优先级：渠道覆盖(row) > 模板显式 > 本文件默认（见 :func:`load_strategy_defaults`）。
 """
 
 from __future__ import annotations
@@ -42,17 +45,15 @@ class Settings(BaseSettings):
     queue_group: str = "ag-workers"
     queue_max_depth: int = 100_000
 
-    # ---- 对象存储 ----
-    # 默认**对接外部对象存储**（生产口径）。本地联调由 docker-compose 的
-    # `${AG_S3_*:-...}` 兜底覆盖成本地 MinIO（见 docker-compose.yml）。
+    # ---- 对象存储（**只服务结果转存**；create 请求体/响应存档走 Redis，见 infra/request_store）----
+    # 默认对接**外部对象存储**（生产口径）。**未配置时转存自动关闭**（模板声明 store 也不转存，
+    # 降级为直链；判据见 :attr:`s3_configured`）—— 网关因此不再依赖任何对象存储即可运行。
     # 凭据**故意不给默认值**：写 `minioadmin` 这类假默认，只会在配置遗漏时静默连上错误的对象存储；
-    # 留空则第一次使用就明确失败 —— 与"不自动建桶"同一取向（部署错误要立刻暴露）。
+    # 留空则整条转存链路自动关闭（而不是第一次写入时才失败）。
     s3_endpoint: str = "https://oss.s3ai.cn"
     s3_access_key: str = ""
     s3_secret_key: str = ""
     s3_bucket: str = "cdn"
-    s3_secure: bool = True
-    result_store_mode: Literal["object", "memory"] = "object"
 
     # ---- 策略组默认值 ----
     idempotency_window_seconds: int = 86_400
@@ -60,22 +61,21 @@ class Settings(BaseSettings):
     task_deadline_seconds: int = 1800
     result_retention_days: int = 30
     result_presign_ttl_seconds: int = 900
-    transfer_max_inline_bytes: int = 1_048_576
     #: 结果**文件**单次拉取上限（转存用）。
     #:
     #: 与"上游 API 响应体上限"（``UpstreamClient.max_response_bytes``，4 MiB）是**两件事**：
     #: 前者是 JSON 状态响应，后者是产物本体。实测火山 3D 产物用 obj + 高细分即 41 MB，
     #: 视频产物量级更高——沿用 4 MiB 会让转存在大小检查处确定性失败
-    #: （表现为 ``succeeded`` + ``result_degraded=['transfer_failed']`` + 结果端点 410）。
+    #: （表现为 ``succeeded`` + ``result_degraded=['transfer_failed']``）。
     result_max_bytes: int = 268_435_456
     #: 结果策略模式的**全局默认**（模板未显式声明 ``result_policy.mode`` 时生效）。
     #:
-    #: 默认 ``passthrough``（不转存、直接给上游直链）的理由：转存链路依赖对象存储
-    #: （MinIO/S3）与"存储地址对调用方可达"这两件在本环境**尚未验证**的事，且上游产物
-    #: 常见几十 MB；先直链可以让链路一次跑通，待对象存储验完再按模板/渠道逐个切回 ``store``。
+    #: 默认 ``passthrough``（不转存、直接给上游直链）：转存链路依赖对象存储与"存储地址对
+    #: 调用方可达"这两件事；先直链可以让链路一次跑通，待对象存储验完再按模板/渠道逐个切回
+    #: ``store``（切 ``store`` 的前提是对象存储已配置，否则自动关闭、仍是直链）。
     #: 代价：结果链接依赖上游有效期（火山 TOS 预签名 24h），且上游直链会暴露给调用方
     #: （envelope ``degraded[]`` 会声明该依赖）。
-    result_mode_default: Literal["store", "passthrough", "redirect"] = "passthrough"
+    result_mode_default: Literal["store", "passthrough"] = "passthrough"
     submit_confirm_window_seconds: int = 120
 
     # 背压：受理速率配额 与 上游并发槽 分离计数（§4.3）
@@ -90,14 +90,9 @@ class Settings(BaseSettings):
     poll_max_interval: float = 60.0
     poll_initial_interval: float = 5.0
     poll_hot_start_samples: int = 30
-    poll_histogram_window_days: int = 7
-    poll_recompute_seconds: int = 300
-    poll_hard_timeout_seconds: float = 10.0
 
     # 查询面（§12.2）
     min_refresh_interval: float = 3.0
-    query_429_circuit_ratio: float = 0.05
-    query_429_circuit_window_seconds: int = 60
 
     # unknown 有界化（§4.4 / §14）
     unknown_max_per_channel: int = 200
@@ -120,8 +115,6 @@ class Settings(BaseSettings):
     #   inline —— 受理请求内同步完成 create：返回上游原生形状（上游 id 原样透出）；
     #             上游受理慢会拖慢受理，仅"必须同步拿上游原生响应"的场景显式配置。
     submit_mode: Literal["inline", "queued"] = "queued"
-    # 数据面凭证的短生命周期存放后端：redis_ephemeral | memory | none
-    credential_channel: Literal["redis_ephemeral", "memory", "none"] = "redis_ephemeral"
 
     # ---- SSRF（§18.1）----
     ssrf_allow_hosts: list[str] = Field(default_factory=list)
@@ -136,24 +129,16 @@ class Settings(BaseSettings):
     callback_hmac_keys: dict[str, str] = Field(default_factory=lambda: {"k1": "dev-only-secret"})
     callback_active_kid: str = "k1"
     callback_tolerance_seconds: int = 300
-    callback_rate_per_minute_per_channel: int = 6000
 
     # ---- 治理面（§18.4）----
     admin_token: str = "dev-admin-token"
-    admin_require_approval: bool = True
     replay_rate_per_minute: int = 100
-
-    # ---- 灰度（§17）----
-    canary_min_samples: int = 100
-    canary_error_sigma: float = 2.0
-    canary_window_seconds: int = 300
 
     # ---- 巡检周期 ----
     scheduler_tick_seconds: float = 1.0
     scheduler_batch_size: int = 500
     inspector_tick_seconds: float = 15.0
     accepted_stall_seconds: int = 60
-    concurrency_calibrate_seconds: int = 30
 
     @field_validator("ssrf_allow_hosts", "ssrf_allow_schemes", "url_direct_allowed_prefixes", mode="before")
     @classmethod
@@ -194,15 +179,29 @@ class Settings(BaseSettings):
         """**只有** ``app_env=test`` 才算测试环境。
 
         这里刻意不把 ``dev`` 也算进来：``dev`` 是 docker-compose 的环境
-        （Redis/Postgres/MinIO 都在），若把它当测试环境，broker 会静默退化成**进程内**
+        （Redis/Postgres 都在），若把它当测试环境，broker 会静默退化成**进程内**
         内存队列——网关受理后投的消息 worker 永远收不到，而且不报任何错。
         """
         return self.app_env == "test"
 
     @property
     def uses_ephemeral_infra(self) -> bool:
-        """是否使用进程内的替身实现（内存 broker / 内存结果存储 / 内存凭证）。"""
+        """是否使用进程内的替身实现（内存 broker / 内存凭证）。"""
         return self.is_test or not self.redis_url
+
+    @property
+    def s3_configured(self) -> bool:
+        """对象存储是否**已配置** —— 结果转存的唯一开关（未配置 ⇒ 转存自动关闭）。
+
+        四项齐全（端点/凭据/桶）才算配置：半套配置只会把失败推迟到第一次写入，
+        不如直接当"没配"处理（对齐"不自动建桶、配置错误要立刻暴露"的取向）。
+        """
+        return bool(self.s3_endpoint and self.s3_access_key and self.s3_secret_key and self.s3_bucket)
+
+    @property
+    def s3_secure(self) -> bool:
+        """TLS 由端点写法决定（``https://`` ⇒ True）；不再单开配置项。"""
+        return self.s3_endpoint.strip().lower().startswith("https")
 
 
 @lru_cache(maxsize=1)

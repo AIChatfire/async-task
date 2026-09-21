@@ -155,6 +155,7 @@ def test_error_code_domain_is_closed():
         "CANCELLED",
         "TRANSFER_FAILED",
         "UNKNOWN_EXHAUSTED",
+        "REQUEST_LOST",
     }
 
 

@@ -37,7 +37,7 @@ from ..domain.state_machine import is_business_terminal
 from ..gateway.container import get_container
 from ..gateway.idempotency import attempt_of, retry_key
 from ..infra.credentials import credential_ttl_seconds
-from ..infra.object_store import request_key
+from ..infra.request_store import body_ttl_seconds, request_key
 from ..observability.logging import configure_logging
 from ..observability.metrics import GOVERNANCE_TOTAL, REGISTRY, render_metrics
 from ..security.callback_auth import new_opaque_token
@@ -612,7 +612,7 @@ async def replay_task(
     ref = parent.create_req_ref
     if ref:
         try:
-            raw = await container.result_store.get_bytes(ref)
+            raw = await container.request_store.get_bytes(ref)
             parsed = json.loads(raw.decode())
             if isinstance(parsed, dict):
                 body = parsed
@@ -639,7 +639,7 @@ async def replay_task(
     from ..gateway.idempotency import window_bucket
 
     child_ref = request_key(parent.tenant, child_id)
-    await container.result_store.put_json(child_ref, body)
+    await container.request_store.put_json(child_ref, body, body_ttl_seconds())
     child = AsyncTask(
         task_id=child_id,
         idempotency_key=child_key,

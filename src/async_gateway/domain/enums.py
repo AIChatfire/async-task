@@ -63,6 +63,7 @@ class ErrorCode(str, Enum):
     CANCELLED = "CANCELLED"
     TRANSFER_FAILED = "TRANSFER_FAILED"
     UNKNOWN_EXHAUSTED = "UNKNOWN_EXHAUSTED"
+    REQUEST_LOST = "REQUEST_LOST"
 
 
 class IdempotencyOutcome(str, Enum):

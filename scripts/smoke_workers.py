@@ -2,8 +2,10 @@
 
 用法：
     AG_APP_ENV=dev AG_DATABASE_URL=sqlite+aiosqlite:////tmp/ag-smoke.db \
-    AG_QUEUE_DRIVER=stream AG_RESULT_STORE_MODE=memory \
+    AG_QUEUE_DRIVER=stream \
     python scripts/smoke_workers.py
+
+（不需要对象存储：转存是可选件，未配置即自动关闭。）
 """
 
 from __future__ import annotations

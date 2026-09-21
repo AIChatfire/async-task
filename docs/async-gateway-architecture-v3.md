@@ -104,7 +104,8 @@ New API 侧计费映射（均在 New API，网关无感知）：提交→预扣�
 
 - **统一结果转存**：结果转存对象存储、回引用（`result_policy.mode: store`）——详见 §12.2 result_policy。
   注：当前**全局默认取 `passthrough`**（先直链，见 `docs/IMPLEMENTATION.md` §3.13），
-  转存链路待对象存储验证后按模板逐个启用。
+  转存链路待对象存储验证后按模板逐个启用。**2026-09-21 起对象存储降级为可选件**：只服务结果转存、
+  只走外部端点；未配置 ⇒ 转存自动关闭（见 `docs/IMPLEMENTATION.md` §3.16）。
 - **无队列内优先级**：渠道级并发隔离 + 全局 FIFO——详见 §4.3、§15。
 - **状态来源主备**：`status_source: callback|poll` 主备不双轨——详见 §12.2。
 - **envelope 双字段 + degraded[]**：仅面向网关自有调用方——详见 §12.2、§16。
@@ -227,7 +228,7 @@ AI/人工起草 → 校验器 → Task-admin 预览（渲染请求样例 + 版�
 | scheduler | Taskiq scheduler | 延迟轮询调度（next_poll_at 派发）；生产固定单副本 + 就绪探针 |
 | inspector | Taskiq beat/worker | 巡检面：accepted 悬挂巡检（按提交意图分流，§14）、deadline 巡检、orphan 对账、unknown 有界化巡检；独立 Deployment、单副本，与 scheduler 故障域隔离 |
 | task-admin | FastAPI + 内部 UI | 治理面，SSO+RBAC，不接生产流量；看板/审计走只读副本 |
-| postgres / redis / minio | - | 真相与审计 / broker 与缓存 / 大对象（桶级加密） |
+| postgres / redis（+ 可选 minio） | - | 真相与审计 / broker 与缓存（请求体、凭证短存）/ 对象存储**只服务结果转存**、可选件（桶级加密） |
 
 ## 11. `/async/` 协议面
 

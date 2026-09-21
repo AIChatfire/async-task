@@ -1,6 +1,9 @@
 # 异步网关（Async Gateway）
 
 给任意「已任务化」的上游（创建任务 + 查询任务模型）套一层**通用排队异步网关**，上游零改动。
+**核心形态 = 透传 + 排队**：受理只落库入队（不等上游）、后台提交与轮询、结果默认透传上游直链——
+运行时只依赖 **Postgres + Redis**，不配置任何对象存储即可完整工作；**结果转存（`store`）是可选增强**
+（只对接外部 MinIO/S3，未配置即自动关闭并在 envelope 声明，见 `docs/IMPLEMENTATION.md` §3.16）。
 已接入的上游：火山方舟 **Seedance**（视频）、**Seed3D**（图生 3D）；同类上游的接入目标是
 「**4 行配置 + 渠道持证**」。New API 侧用其**任务插件**渠道即可对接 ——
 方舟形态插件**零改动复用**（渠道 base_url 指向网关），见下。
@@ -34,7 +37,9 @@
 
 ## 配置
 
-所有配置项以 `AG_` 前缀注入（嵌套用双下划线）。**权威清单**是 [`.env.example`](.env.example)：
+所有配置项一律以 `AG_` 前缀注入（嵌套用双下划线）。**前缀是刻意保留的**：部署环境常导出同名
+通用变量（`DATABASE_URL` / `REDIS_URL` / `LOG_LEVEL` …），无前缀时它们会被静默读到并顶掉本 `.env` 的值。
+**权威清单**是 [`.env.example`](.env.example)：
 它与代码里的 `Settings` **逐字段对齐**（有门禁 `tests/test_env_contract.py` 守着双向一致），
 文件顶部列出**生产部署必改项**。`docker-compose.yml` 会注入 `.env`（`required: false`），
 所以照模板配的项在容器路径上也真的生效。
@@ -98,7 +103,8 @@ scripts/
    且只存引用与哈希。
 5. **模板即代码**：表达式限定 JSONPath 严格子集（禁通配/递归/过滤器/脚本），带步数、结果大小、
    求值超时上限；AI 产物不直写生产（校验 → 预览 → dry-run → 评审四道闸）。
-6. **结果策略默认不转存**：`AG_RESULT_MODE_DEFAULT=passthrough` —— 结果字段直接用上游直链，
-   规避尚未验证的对象存储链路；代价是链接依赖上游有效期（envelope `degraded[]` 会声明）。
+6. **结果策略默认不转存；转存是可选件**：`AG_RESULT_MODE_DEFAULT=passthrough` —— 结果字段直接用上游直链。
+   转存（`store`）**只走外部 MinIO/S3**，且 `S3_*` 四项未配齐时**自动关闭**（保留上游直链，并在
+   envelope `degraded[]` 声明 `transfer_disabled`）；代价是直链依赖上游有效期。
    切到 `store` 转存时必须保证**数据面 IO 用原始 URL**：上游结果多为预签名地址，
-   脱敏只作用于对外输出（见 `docs/IMPLEMENTATION.md` §3.11、§3.13）。
+   脱敏只作用于对外输出（见 `docs/IMPLEMENTATION.md` §3.11、§3.13、§3.16）。

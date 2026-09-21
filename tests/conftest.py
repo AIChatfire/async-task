@@ -19,8 +19,14 @@ os.environ.update(
         # 本机 .env 里 AG_REDIS_URL 可能是生产占位符（<redis-host>）：显式钉住，测试不依赖它。
         # 只有 redis 标记的用例会真的连它（其余全部走内存替身，见 is_test / uses_ephemeral_infra）。
         "AG_REDIS_URL": "redis://localhost:6379/0",
-        "AG_RESULT_STORE_MODE": "memory",
-        # 注意与上一行的区别：这一项是"结果**策略**模式"（store/passthrough）。
+        # 对象存储：测试**一律不接真机**（防误写生产桶）。需要转存的用例由 result_store fixture
+        # 注入内存替身（set_result_store）；「未配置 ⇒ 转存自动关闭」另有专门用例覆盖。
+        "AG_S3_ENDPOINT": "",
+        "AG_S3_ACCESS_KEY": "",
+        "AG_S3_SECRET_KEY": "",
+        "AG_S3_BUCKET": "",
+        # 结果**策略**模式（store/passthrough），与请求数据的存储后端无关：
+        # 请求体/响应存档走 request store（本基座注入内存实现，见 request_store fixture）。
         # 既有用例假定"成功即转存"（store），故测试环境显式指定；
         # "默认取配置"这条逻辑另有专门用例（test_templates.py）覆盖。
         "AG_RESULT_MODE_DEFAULT": "store",
@@ -68,6 +74,7 @@ from async_gateway.gateway.container import Container, configure_container  # no
 from async_gateway.infra.concurrency import MemoryAcceptRateLimiter, MemoryConcurrencyLimiter  # noqa: E402
 from async_gateway.infra.credentials import MemoryEphemeralCredentials, set_credential_store  # noqa: E402
 from async_gateway.infra.object_store import MemoryResultStore, set_result_store  # noqa: E402
+from async_gateway.infra.request_store import MemoryRequestStore, set_request_store  # noqa: E402
 from async_gateway.infra.polling import MemoryPollingController  # noqa: E402
 from async_gateway.security.callback_auth import CallbackAuthenticator  # noqa: E402
 from async_gateway.templates.registry import TemplateRegistry  # noqa: E402
@@ -238,6 +245,13 @@ def result_store() -> MemoryResultStore:
 
 
 @pytest.fixture
+def request_store() -> MemoryRequestStore:
+    store = MemoryRequestStore()
+    set_request_store(store)
+    return store
+
+
+@pytest.fixture
 def credentials() -> MemoryEphemeralCredentials:
     store = MemoryEphemeralCredentials()
     set_credential_store(store)
@@ -264,6 +278,7 @@ def authenticator() -> CallbackAuthenticator:
 def container(
     registry: TemplateRegistry,
     result_store: MemoryResultStore,
+    request_store: MemoryRequestStore,
     credentials: MemoryEphemeralCredentials,
     fake_upstream: FakeUpstream,
 ) -> Container:
@@ -273,6 +288,7 @@ def container(
         accept_limiter=MemoryAcceptRateLimiter(rate=1000.0, burst=1000),
         polling=MemoryPollingController(),
         result_store=result_store,
+        request_store=request_store,
         channel_policies={},
     )
     c.set_bus(MemoryBus())

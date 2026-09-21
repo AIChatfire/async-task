@@ -5,6 +5,9 @@ venv/
 *.db
 *.sqlite3
 .env
+# env 变体（.env.bak / .env.local 等）同样不入库；仅模板 .env.example 例外
+.env.*
+!.env.example
 .pytest_cache/
 .ruff_cache/
 dist/

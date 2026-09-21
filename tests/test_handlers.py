@@ -502,3 +502,35 @@ async def test_audit_stores_only_references(client, container, fake_upstream, db
     assert any(r.event_type == AuditEventType.TERMINAL for r in rows) or any(
         r.event_type == AuditEventType.ACCEPTED for r in rows
     )
+
+async def test_transfer_auto_disabled_when_store_unconfigured(
+    client, container, fake_upstream, db, monkeypatch
+):
+    """未配置对象存储 ⇒ 转存自动关闭：不派发 transfer、结果保留上游直链、envelope 声明降级。"""
+    from async_gateway.infra.object_store import MemoryResultStore, set_result_store
+
+    monkeypatch.setattr(container, "result_store", None, raising=False)
+    set_result_store(None)
+    try:
+        created = await client.post("/async/echo/v1/tasks", json={"prompt": "x"}, headers=AUTH)
+        task_id = created.headers["x-ag-task-id"]
+        upstream_id = created.headers["x-ag-upstream-id"]
+        fake_upstream.set_status(upstream_id, "succeeded")
+        await drain(container.bus, "poll:light-poll", container)
+
+        task = await get_task(task_id)
+        assert task.status == TaskStatus.SUCCEEDED.value
+        assert task.result_ref is None  # 没有转存
+        assert await container.bus.depth(TRANSFER_QUEUE) == 0  # 也没有派发 transfer
+
+        queried = await client.get(
+            f"/async/echo/v1/tasks/{task_id}", headers={**AUTH, "x-ag-envelope": "1"}
+        )
+        body = queried.json()
+        codes = [n["code"] for n in body["_envelope"]["degraded"]]
+        assert "transfer_disabled" in codes
+        assert "result_pending" not in codes  # 没转存就不该谎报"转存中"
+        # 结果仍是上游直链（没被清空）——信封把原生体放在 data 下
+        assert body["data"]["output"]["url"].startswith(fake_upstream.base_url)
+    finally:
+        set_result_store(MemoryResultStore())

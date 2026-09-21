@@ -1,8 +1,15 @@
 """结果存储（§12.2 result_policy = store / §18.8 数据合规）。
 
-**仅 store 模式**使用：结果转存对象存储后，网关把 ``result_ref`` **现算**成预签名 URL
-写进**查询响应**的字段里 —— 网关自身不提供结果端点（见 `docs/IMPLEMENTATION.md` §3.14）。
-当前全局默认是 ``passthrough``（不转存），故本模块默认不参与链路。
+**只服务结果转存**：store 模式下把上游产物转存到对象存储，网关把 ``result_ref``
+**现算**成预签名 URL 写进**查询响应**的字段里 —— 网关自身不提供结果端点（见
+`docs/IMPLEMENTATION.md` §3.14）。
+
+2026-09-21 裁定（用户指令「转存只走外部 minio、不配置自动不转存、精简架构」）：
+
+* 对象存储是**可选件**：``get_result_store()`` 在未配置时返回 ``None``，转存链路**自动关闭**
+  （模板声明 ``store`` 也不转存，降级为直链并在 envelope 声明）——网关仅凭 PG + Redis 即可运行；
+* 默认（也是唯一）对接**外部** MinIO/S3（``https://oss.s3ai.cn``）；不再有本地/同机内网那一套；
+* 受理路径的 create 请求体 / 响应存档**不经对象存储**（走 Redis，见 ``infra/request_store.py``）。
 
 约定：
 
@@ -22,6 +29,7 @@ from __future__ import annotations
 import io
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Protocol
 
 import anyio.to_thread
@@ -62,21 +70,12 @@ def result_key(
     一级前缀是**任务创建日期（UTC）**，与"按天分目录"的桶生命周期 / 清理策略对齐。
     取"创建时间"而不是"写入时刻"：失败重试与跨天重放都会落在同一目录，不产生跨日碎片。
     """
-    from datetime import UTC, datetime
+    from datetime import UTC, datetime as _dt
 
-    moment = created_at or datetime.now(UTC)
+    moment = created_at or _dt.now(UTC)
     if moment.tzinfo is None:  # 兜底：naive 一律按 UTC 解释，别用本机时区偏移
         moment = moment.replace(tzinfo=UTC)
     return f"{moment.astimezone(UTC):%Y%m%d}/{tenant}/{task_id}/attempt-{attempt}.{ext}"
-
-
-def request_key(tenant: str, task_id: str) -> str:
-    return f"requests/{tenant}/{task_id}/create.json"
-
-
-def create_response_key(tenant: str, task_id: str) -> str:
-    """受理响应的存档位置：幂等重放必须返回**同一份**上游原生响应。"""
-    return f"requests/{tenant}/{task_id}/create_response.json"
 
 
 class MemoryResultStore:
@@ -116,7 +115,7 @@ class MemoryResultStore:
 
 
 class MinioResultStore:
-    """MinIO / S3 兼容实现；同步客户端放线程池，避免阻塞事件循环。"""
+    """MinIO / S3 兼容实现（外部端点）；同步客户端放线程池，避免阻塞事件循环。"""
 
     def __init__(self) -> None:
         from minio import Minio
@@ -207,11 +206,18 @@ class MinioResultStore:
 _store: ResultStore | None = None
 
 
-def get_result_store() -> ResultStore:
+def get_result_store() -> ResultStore | None:
+    """结果转存用的对象存储。
+
+    **未配置（``s3_configured`` 为假）时返回 ``None``** —— 调用方据此自动关闭转存
+    （不派发、不重试、不告警；查询面降级为直链并在 envelope 声明）。
+    测试/嵌入方可用 :func:`set_result_store` 注入替身。
+    """
     global _store
     if _store is None:
-        settings = get_settings()
-        _store = MemoryResultStore() if settings.result_store_mode == "memory" else MinioResultStore()
+        if not get_settings().s3_configured:
+            return None
+        _store = MinioResultStore()
     return _store
 
 

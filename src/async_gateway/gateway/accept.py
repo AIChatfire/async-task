@@ -31,7 +31,7 @@ from ..domain.enums import ErrorCode, Origin, TaskStatus
 from ..gateway.container import AuthContext, Container
 from ..gateway.idempotency import resolve_key, window_bucket
 from ..infra.credentials import credential_ttl_seconds
-from ..infra.object_store import create_response_key, request_key
+from ..infra.request_store import body_ttl_seconds, request_key, response_key, response_ttl_seconds
 from ..security.callback_auth import new_opaque_token
 from ..templates.registry import TemplateVersion
 from ..templates.render import render_create
@@ -60,7 +60,7 @@ class AcceptError(Exception):
 
 
 def _response_ref(tenant: str, task_id: str) -> str:
-    return create_response_key(tenant, task_id)
+    return response_key(tenant, task_id)
 
 
 async def _admit(container: Container, bus: Bus, channel: str) -> None:
@@ -93,7 +93,7 @@ async def accept_create(
 ) -> AcceptResult:
     template = tv.resolved
     strategy = container.strategy_for(auth.channel, tv)
-    store = container.result_store
+    store = container.request_store
 
     # ---- 背压 ----
     await _admit(container, bus, auth.channel)
@@ -120,10 +120,11 @@ async def accept_create(
     task_id = uuid.uuid4().hex[:24]
     deadline_seconds = int(request_deadline_seconds or strategy.get("deadline_seconds", 1800))
     ref = request_key(auth.tenant, task_id)
-    await store.put_json(ref, body)
+    await store.put_json(ref, body, body_ttl_seconds())
     await store.put_json(
         _response_ref(auth.tenant, task_id),
         {"status": None, "body": None, "pending": True},
+        response_ttl_seconds(),
     )
 
     task = AsyncTask(
@@ -257,8 +258,9 @@ async def _inline_submit(
     # 把原始 create 响应存起来：幂等重放要返回同一份
     resp_ref = _response_ref(auth.tenant, task_id)
     if task.status == TaskStatus.UPSTREAM_SUBMITTED.value:
-        await container.result_store.put_json(
-            resp_ref, {"status": native_status, "body": native, "pending": False}
+        await container.request_store.put_json(
+            resp_ref, {"status": native_status, "body": native, "pending": False},
+            response_ttl_seconds(),
         )
         # 立即派发一次轮询，尽快把快照填成"查询形状"
         await bus.enqueue(poll_queue(template.pool), "poll_upstream", {"task_id": task_id})
@@ -270,8 +272,9 @@ async def _inline_submit(
         )
 
     if status is TaskStatus.SUBMIT_UNKNOWN:
-        await container.result_store.put_json(
-            resp_ref, {"status": 504, "body": native, "pending": False}
+        await container.request_store.put_json(
+            resp_ref, {"status": 504, "body": native, "pending": False},
+            response_ttl_seconds(),
         )
         return AcceptResult(
             task_id=task_id,
@@ -288,8 +291,9 @@ async def _inline_submit(
         )
 
     # 明确失败：把上游的错误响应原样回给调用方（形状保真 + 让 New API 立刻判失败）
-    await container.result_store.put_json(
-        resp_ref, {"status": native_status, "body": native, "pending": False}
+    await container.request_store.put_json(
+        resp_ref, {"status": native_status, "body": native, "pending": False},
+        response_ttl_seconds(),
     )
     return AcceptResult(
         task_id=task_id,
@@ -319,7 +323,7 @@ async def _replay_or_conflict(container: Container, existing: AsyncTask, digest:
     try:
         import json
 
-        raw = await container.result_store.get_bytes(ref)
+        raw = await container.request_store.get_bytes(ref)
         stored = json.loads(raw.decode())
     except Exception:  # noqa: BLE001 - 响应还没落盘（inline 尚未完成）时退化为 202
         stored = {}

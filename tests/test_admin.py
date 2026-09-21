@@ -13,7 +13,7 @@ import pytest_asyncio
 from async_gateway.db.base import session_scope
 from async_gateway.db.models import AsyncTask
 from async_gateway.domain.enums import Origin, TaskStatus
-from async_gateway.infra.object_store import request_key
+from async_gateway.infra.request_store import request_key
 
 ADMIN_TOKEN = "test-admin"
 
@@ -249,9 +249,9 @@ async def test_replay_requires_data_plane_credential(admin):
     assert "X-AG-Credential" in json.dumps(response.json(), ensure_ascii=False)
 
 
-async def test_replay_creates_child_task_and_keeps_parent(admin, container, result_store):
+async def test_replay_creates_child_task_and_keeps_parent(admin, container, request_store):
     task_id = await _insert_parent(upstream_task_id=None, idempotency_key="auto:key1|deadbeef")
-    await result_store.put_json(request_key("default", task_id), {"prompt": "replay me"})
+    await request_store.put_json(request_key("default", task_id), {"prompt": "replay me"}, 3600)
     ticket = await _replay_ticket(admin, task_id)
     response = await admin.post(
         f"/admin/tasks/{task_id}/replay",
@@ -274,7 +274,7 @@ async def test_replay_creates_child_task_and_keeps_parent(admin, container, resu
     assert await container.credential_store.get(child_id) == "Bearer sk-replay"
 
 
-async def test_replay_rate_limit(admin, container, result_store, monkeypatch):
+async def test_replay_rate_limit(admin, container, request_store, monkeypatch):
     from async_gateway.admin.app import _REPLAY_TIMES
     from async_gateway.config import get_settings
 
@@ -284,7 +284,7 @@ async def test_replay_rate_limit(admin, container, result_store, monkeypatch):
     codes = []
     for _ in range(4):
         tid = await _insert_parent(upstream_task_id=None)
-        await result_store.put_json(request_key("default", tid), {"prompt": "x"})
+        await request_store.put_json(request_key("default", tid), {"prompt": "x"}, 3600)
         ticket = await _replay_ticket(admin, tid)
         response = await admin.post(
             f"/admin/tasks/{tid}/replay",

@@ -12,8 +12,6 @@
 * 凭证进入 **Redis（内存语义）**，键为 ``cred:{task_id}``，**带 TTL**（受理时按
   deadline 计算，默认不超过 30 分钟），**不写入 Postgres、不落磁盘、不进日志**；
 * 任务进入终态（或转人工确认、或转存结束）时**立即删除**；
-* 提供 ``none`` 后端：把 ``AG_CREDENTIAL_CHANNEL=none`` 打开后，worker 拿不到凭证，
-  提交/轮询只能由客户端请求驱动（透传模式的原教旨形态）——用于需要"绝对不驻留"的场景。
 
 该裁定需要在架构评审上确认（列入 docs/IMPLEMENTATION.md 的"待确认决策"）。
 """
@@ -74,19 +72,6 @@ class MemoryEphemeralCredentials:
 
     async def drop(self, task_id: str) -> None:
         self.values.pop(task_id, None)
-
-
-class NullCredentials:
-    """原教旨透传：不驻留任何凭证，worker 侧因此无法自行发起上游调用。"""
-
-    async def put(self, task_id: str, header_value: str, ttl_seconds: int) -> None:
-        return None
-
-    async def get(self, task_id: str) -> str | None:
-        return None
-
-    async def drop(self, task_id: str) -> None:
-        return None
 
 
 _store: CredentialStore | None = None

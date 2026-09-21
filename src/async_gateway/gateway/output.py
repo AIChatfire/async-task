@@ -29,6 +29,7 @@ from typing import Any
 from ..db.models import AsyncTask
 from ..domain.enums import OutputTerminal, TaskStatus
 from ..domain.state_machine import is_internal_terminal, output_terminal
+from ..infra.object_store import get_result_store
 from ..templates.derive import effective_failure_error_code, effective_failure_status
 from ..templates.expression import compile_expression
 from ..templates.schema import ResultMode, ResolvedTemplate
@@ -88,6 +89,10 @@ def degraded_notices(task: AsyncTask, template: ResolvedTemplate, *, result_avai
         notices.append(
             DegradedNotice("passthrough_result", "结果直链依赖上游有效期，未转存")
         )
+    if template.result_policy.mode is ResultMode.STORE and get_result_store() is None:
+        notices.append(
+            DegradedNotice("transfer_disabled", "未配置对象存储，已自动关闭结果转存（结果直链透传）")
+        )
     if task.result_degraded:
         notices.append(DegradedNotice("result_unavailable", "结果转存永久失败，结果端点返回 410"))
     if TaskStatus(task.status) is TaskStatus.POLL_UNRECOGNIZED:
@@ -107,7 +112,12 @@ def degraded_notices(task: AsyncTask, template: ResolvedTemplate, *, result_avai
         )
     if template.status_source.value == "callback" and not template.capabilities.callback:
         notices.append(DegradedNotice("callback_unavailable", "上游无可靠回调，已降级为轮询"))
-    if not result_available and TaskStatus(task.status) is TaskStatus.SUCCEEDED:
+    if (
+        not result_available
+        and TaskStatus(task.status) is TaskStatus.SUCCEEDED
+        and template.result_policy.mode is ResultMode.STORE
+        and get_result_store() is not None  # 转存被自动关闭时不谎报"转存中"（见 transfer_disabled）
+    ):
         notices.append(DegradedNotice("result_pending", "结果转存进行中，稍后重试结果端点"))
     return notices
 
@@ -213,7 +223,7 @@ def build_native_query_response(
     status = TaskStatus(task.status)
     is_success = status is TaskStatus.SUCCEEDED
     if is_success:
-        if template.result_policy.mode is ResultMode.STORE:
+        if template.result_policy.mode is ResultMode.STORE and get_result_store() is not None:
             # store：结果字段 = 对象存储的预签名 URL（直给，不经网关中转）
             try:
                 set_path_on_doc(snapshot, template.result_location, result_url)

@@ -47,8 +47,8 @@ def test_env_template_matches_settings_fields_both_ways():
     declared = set(template_keys())
 
     # 防空转：数量下界 + 权威文件必须在场
-    assert len(expected) >= 60, f"Settings 字段只有 {len(expected)} 个 ⇒ 导入/映射规则有问题"
-    assert len(declared) >= 60, f"模板只解析出 {len(declared)} 个键 ⇒ 解析规则有问题"
+    assert len(expected) >= 55, f"Settings 字段只有 {len(expected)} 个 ⇒ 导入/映射规则有问题"
+    assert len(declared) >= 55, f"模板只解析出 {len(declared)} 个键 ⇒ 解析规则有问题"
 
     missing = sorted(expected - declared)
     extra = sorted(declared - expected)
@@ -69,12 +69,12 @@ def test_env_template_has_no_empty_value_with_inline_comment():
 def test_empty_template_values_fall_back_to_code_default():
     """模板里留空的项，代码默认必须是 None —— 否则显式空串会顶掉默认值。"""
     empty = [k for k, v in template_keys().items() if v == ""]
-    assert empty, "模板里应至少有一个留空项（如 AG_LOGFIRE_TOKEN）⇒ 门禁可能在空转"
+    assert empty, "模板里应至少有一个留空项（如 AG_LOGFIRE_TOKEN / AG_S3_ACCESS_KEY）⇒ 门禁可能在空转"
     for key in empty:
         field = Settings.model_fields[key[len("AG_") :].lower()]
-        assert field.default is None, (
+        assert field.default is None or field.default == "", (
             f"{key} 在模板里留空，但代码默认是 {field.default!r}："
-            "空串会顶掉默认值（要么改成 `or DEFAULT` 语义，要么模板别留空）"
+            "非空默认值会被空串顶掉（要么改成 `or DEFAULT` 语义，要么模板别留空）"
         )
 
 
@@ -95,7 +95,7 @@ def test_compose_app_env_allows_dotenv_override():
     """`environment:` 优先级高于 `env_file:`，所以那几项必须写成 ${VAR:-默认} 才能被 .env 覆盖。"""
     doc = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
     app_env = doc["x-app-env"]
-    assert len(app_env) >= 8, f"x-app-env 只解析出 {len(app_env)} 项 ⇒ 解析有问题"
+    assert len(app_env) >= 5, f"x-app-env 只解析出 {len(app_env)} 项 ⇒ 解析有问题"
     for key, value in app_env.items():
         assert isinstance(value, str) and value.startswith("${") and ":-" in value, (
             f"{key} 的值是字面量 ⇒ 会覆盖 .env，用户在 .env 里改了不生效"

@@ -26,8 +26,8 @@ make inspector     # 单副本巡检面
 make compose-up    # 全部依赖 + 进程（需要 Docker，本机没有）
 ```
 
-本地最小闭环不依赖任何外部服务：默认 `AG_RESULT_STORE_MODE=memory`、
-`AG_QUEUE_DRIVER=memory`（测试环境）、假上游用 `httpx.MockTransport` 注入。
+本地最小闭环不依赖任何外部服务：测试环境注入内存 broker / 内存 request store、
+假上游用 `httpx.MockTransport` 注入；**对象存储完全不参与**（未配置 ⇒ 转存自动关闭，见 §3.16）。
 
 ---
 
@@ -101,15 +101,15 @@ make compose-up    # 全部依赖 + 进程（需要 Docker，本机没有）
 > 09-21 依据"提交必须不等上游（对齐异步网关解耦目标，治上游同步受理慢）"改为 `queued`，
 > 并补齐三处配套：202 体可解析 id / 查询面网关 id 兜底 / 预创建期合成状态词。
 
-### 3.2 数据面凭证的短生命周期存放（`AG_CREDENTIAL_CHANNEL`）
+### 3.2 数据面凭证的短生命周期存放（Redis 短存）
 
 文档 §18.2 要求"网关不存 key、不落盘"，但 worker 之后的轮询必须用这个 key。二者字面上冲突。
 落地裁定：
 
 * 凭证进 **Redis**（内存语义），键 `cred:{task_id}`，**TTL ≤ 任务 deadline + 5min**，
   不写 Postgres、不落磁盘、不进日志；任务进终态立即删除；
-* `AG_CREDENTIAL_CHANNEL=none` 提供"绝对不驻留"形态——此时只有客户端请求能驱动透传
-  （查询面会在客户端带凭证时同步刷新）；
+* 「绝对不驻留」形态（worker 拿不到凭证、只有客户端请求能驱动透传）原由 `CREDENTIAL_CHANNEL=none`
+  提供，2026-09-21 参数精简时随其它未接线开关一并移除；当前后端是 Redis（生产）/ 进程内（测试）；
 * **`queued`（默认）下提交阶段的 create 在 worker 里跑，依赖这份短驻留凭证**；`inline` 下
   提交阶段完全不依赖它（凭证不出请求），只有后台轮询/补偿/转存用得到。
 
@@ -286,8 +286,8 @@ New API 的任务插件是**单文件 JS**，上游路径是**硬编码**的
 
 | 方向 | 发现 | 处置 |
 |---|---|---|
-| **代码读、模板没登记** | `Settings` 共 75 个字段，`.env.example` 只登记 44 个 ⇒ **31 个开关运维根本不知道存在**（含 `AG_QUEUE_DRIVER`、`AG_RESULT_STORE_MODE`、`AG_SSRF_DENY_PRIVATE`、`AG_MIN_REFRESH_INTERVAL`、`AG_CANARY_*` 等），照模板配永远用默认值 | 模板补齐为**逐字段对齐的权威清单**，并在顶部列出「生产部署必改项」 |
-| **模板有、编排不注入** | `docker-compose.yml` 的 `x-app-env` 只显式列 10 项、且**没有 `env_file`** ⇒ 其余 **34 项**照模板配了在容器里**全部不生效**（不报错、不告警） | 给 `x-app-build` 加 `env_file: [{path: .env, required: false}]`（app 服务经锚点继承）；那 10 项改成 `${AG_XXX:-默认}` —— `environment` 优先级**高于** `env_file`，不这么写 `.env` 覆盖不了 |
+| **代码读、模板没登记** | `Settings` 共 75 个字段，`.env.example` 只登记 44 个 ⇒ **31 个开关运维根本不知道存在**（含 `AG_QUEUE_DRIVER`、`RESULT_STORE_MODE`、`AG_SSRF_DENY_PRIVATE`、`AG_MIN_REFRESH_INTERVAL`、`CANARY_*` 等），照模板配永远用默认值 | 模板补齐为**逐字段对齐的权威清单**，并在顶部列出「生产部署必改项」 |
+| **模板有、编排不注入** | `docker-compose.yml` 的 `x-app-env` 只显式列 10 项、且**没有 `env_file`** ⇒ 其余 **34 项**照模板配了在容器里**全部不生效**（不报错、不告警） | 给 `x-app-build` 加 `env_file: [{path: .env, required: false}]`（app 服务经锚点继承）；那 10 项改成 `${XXX:-默认}` —— `environment` 优先级**高于** `env_file`，不这么写 `.env` 覆盖不了 |
 | **形态陷阱** | `KEY=  # 注释` 会被解析器把注释整段当成值（fail-open；空值语义静默失效） | 门禁静态扫该形态；模板约定「留空就写 `KEY=`，要注释就写 `KEY=值  # 注释`」 |
 | **空串顶默认值** | 模板里留空的项，若代码默认非 `None`，显式空串会把默认值顶掉 | 门禁断言「模板留空项 ⇒ 代码默认必须是 `None`」 |
 
@@ -299,13 +299,41 @@ New API 的任务插件是**单文件 JS**，上游路径是**硬编码**的
 （证明"声明的键会被注入"），**没有**做运行态对差（`docker inspect` 实注入 env）。生产不以这份
 compose 部署（生产为 K8s）。
 
-**附带（同日）**：`AG_S3_ENDPOINT` / `AG_S3_BUCKET` / `AG_S3_SECURE` 的**代码默认值**改为外部对象存储
-（`https://oss.s3ai.cn` / `cdn` / `true`），取消"模板给生产值、代码默认给本机值"的两套口径；
-**凭据默认值改为空串** —— 不留 `minioadmin` 这类假默认：配置遗漏时要**立刻失败**，而不是静默连上
-错误的对象存储（与"不自动建桶"同一取向）。本地联调仍由 compose 的 `${AG_S3_*:-…}` 兜底成本地 MinIO。
+**附带（同日）**：`AG_S3_ENDPOINT` / `AG_S3_BUCKET` 的**代码默认值**改为外部对象存储
+（`https://oss.s3ai.cn` / `cdn`；`S3_SECURE` 已于 09-21 移除、改为按端点写法推导），取消"模板给生产值、
+代码默认给本机值"的两套口径；**凭据默认值改为空串** —— 不留 `minioadmin` 这类假默认。
+（**2026-09-21 更新**：compose 里的本地 MinIO 已删除；转存只走外部、未配置即自动关闭，见 §3.16。）
 
 冒烟脚本：`scripts/smoke_workers.py`（起 scheduler 2 tick → inspector 1 tick → worker 消费并 ACK 一条消息，
 走真实 Redis Streams 消费组）。实测输出：`SMOKE OK`。
+
+### 3.16 架构精简：对象存储降级为可选件、配置去前缀（2026-09-21 裁定）
+
+用户指令：「**转存只走外部 minio、不配置自动不转存、精简架构；配置参数优化，环境变量去 `AG_` 前缀**」。
+落地五件：
+
+1. **受理不再依赖对象存储**：create 请求体与受理/上游响应存档（原 `requests/{tenant}/{task_id}/…`
+   对象）迁到 **Redis 短生命周期存放**（`infra/request_store.py`，键 `req:` / `reqresp:`，TTL 分别按
+   任务 deadline 与幂等窗口）——`queued` 语义要的"跨进程共享"交给 Redis（它本来就在关键路径上）。
+   收益：本地/单机部署不用起 MinIO。代价：Redis 数据丢失时提交**显式失败**（新错误码 `REQUEST_LOST`，
+   不可重试），不再拿空体去调上游（空体只会被上游判成客户端的错）。
+2. **对象存储只服务结果转存、只走外部**：`get_result_store()` 在 `s3_configured`（端点/凭据/桶四项
+   齐全）为假时返回 `None` ⇒ **转存自动关闭**：不派发 transfer、不重试、不告警；查询响应保留上游直链，
+   并在 envelope `degraded[]` 加 `transfer_disabled` 声明（不假装转存过）。
+3. **compose 精简**：删掉 `minio` / `minio-init` 两个容器与 `miniodata` 卷；要转存就在 `.env` 配 `S3_*`。
+4. **配置参数精简**：去掉 13 个**从未接线**的开关（`TRANSFER_MAX_INLINE_BYTES`、
+   `POLL_HISTOGRAM_WINDOW_DAYS`、`POLL_RECOMPUTE_SECONDS`、`POLL_HARD_TIMEOUT_SECONDS`、
+   `QUERY_429_CIRCUIT_RATIO`、`QUERY_429_CIRCUIT_WINDOW_SECONDS`、`CREDENTIAL_CHANNEL`、
+   `CALLBACK_RATE_PER_MINUTE_PER_CHANNEL`、`ADMIN_REQUIRE_APPROVAL`、`CANARY_*`×3、
+   `CONCURRENCY_CALIBRATE_SECONDS`）、合并 2 个（`S3_SECURE` ⇒ 按端点写法推导；
+   `RESULT_STORE_MODE` ⇒ 后端固定对象存储、测试注入内存替身）、`AG_RESULT_MODE_DEFAULT` 去掉未实现的
+   `redirect`。**未接线就不该出现在权威清单里**——那正是 §3.15 要防的"配了不生效"。
+5. **环境变量**：`Settings.env_prefix` 一度改为空（"去前缀"），**同日复核后恢复 `AG_` 前缀** ——
+   部署环境常导出同名的通用变量（`DATABASE_URL`/`REDIS_URL`/`LOG_LEVEL`…），无前缀会被静默读到并顶掉
+   默认值，前缀即隔离。（镜像自证标签 `AG_IMAGE_VERSION` 是制品元数据、非配置项，照旧保留。）
+
+**未验证**：本机**无 Docker** ⇒ 精简后的 compose 只做静态断言（`test_env_contract` 的 yaml 解析）；
+Redis 请求存储的真实链路（多进程 create body 交付）需在容器/真机上复验。
 
 ---
 

@@ -163,7 +163,8 @@ async def _presigned_result_url(container: Container, task: AsyncTask, template)
     网关对外**只透传上游原生路径**（提交/查询/取消），不额外发明"结果路径"。
     转存未完成、对象已过期或被删除时返回 ``None``，响应侧据此把结果字段留空。
     """
-    if template.result_policy.mode is not ResultMode.STORE or task.result_ref is None:
+    store = container.result_store
+    if template.result_policy.mode is not ResultMode.STORE or task.result_ref is None or store is None:
         return None
     ttl = int(
         template.result_policy.presign_ttl_seconds
@@ -171,7 +172,7 @@ async def _presigned_result_url(container: Container, task: AsyncTask, template)
         or container.settings.result_presign_ttl_seconds
     )
     try:
-        return await container.result_store.presign_get(task.result_ref, ttl)
+        return await store.presign_get(task.result_ref, ttl)
     except ObjectNotFound:
         return None
 

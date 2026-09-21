@@ -27,8 +27,10 @@ from typing import Any
 # 必须在导入 async_gateway 之前落定配置：derive.STRATEGY_KEYS 等在导入期只读一次。
 os.environ.setdefault("AG_APP_ENV", "dev")
 os.environ.setdefault("AG_DATABASE_URL", "sqlite+aiosqlite:////tmp/ag-live-seed3d.db")
-os.environ.setdefault("AG_RESULT_STORE_MODE", "memory")
+os.environ.setdefault("RESULT_STORE_MODE", "memory")
 os.environ.setdefault("AG_QUEUE_DRIVER", "memory")
+# 请求体/限流器等本脚本单进程运行：清空 AG_REDIS_URL ⇒ 全部走进程内替身（不需要 Redis）
+os.environ.setdefault("AG_REDIS_URL", "")
 os.environ.setdefault("AG_MIN_REFRESH_INTERVAL", "0")
 os.environ.setdefault("AG_LOG_LEVEL", "WARNING")
 os.environ.setdefault("AG_CALLBACK_BASE_URL", "http://localhost:8000")

@@ -26,6 +26,7 @@ from ..infra.concurrency import (
     RedisConcurrencyLimiter,
 )
 from ..infra.object_store import ResultStore, get_result_store
+from ..infra.request_store import RequestStore, get_request_store
 from ..infra.polling import MemoryPollingController, PollingController, RedisPollingController
 from ..templates.registry import TemplateRegistry, TemplateVersion
 from ..upstream.client import UpstreamClient
@@ -107,6 +108,7 @@ class Container:
         accept_limiter: Any | None = None,
         polling: PollingController | None = None,
         result_store: ResultStore | None = None,
+        request_store: RequestStore | None = None,
         channel_policies: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.settings = settings or get_settings()
@@ -124,6 +126,8 @@ class Container:
             RedisPollingController() if self._redis_ready else MemoryPollingController()
         )
         self.result_store = result_store or get_result_store()
+        #: 任务请求数据（create 请求体 / 响应存档）—— Redis 短生命周期存放（见 infra/request_store）
+        self.request_store = request_store or get_request_store()
         #: 渠道策略缓存（生产由 DB 装载；此处支持静态注入，便于测试与单机联调）
         self.channel_policies: dict[str, dict[str, Any]] = channel_policies or {}
         self._bus: Any | None = None

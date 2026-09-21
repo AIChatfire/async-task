@@ -2,8 +2,9 @@
 
 三条不可让步的约束：
 
-1. **大字段一律引用**（``create_req_ref`` / ``result_ref`` 指向对象存储），不把请求体/
-   结果体塞进行里。
+1. **大字段一律引用**：``result_ref`` 指向对象存储（转存产物，未配置对象存储时恒为空）；
+   ``create_req_ref`` 指向 **Redis**（``infra/request_store`` 的短生命周期请求数据）——
+   都不把请求体/结果体塞进行里。
 2. **``audit_event`` 独立表 + append-only**，与任务表分离；看板聚合走只读副本。
 3. **所有写路径带前置条件**——条件更新由 :mod:`async_gateway.db.dao` 统一实现，
    模型层用 ``status`` + 版本号 ``row_version`` 支撑 CAS。
@@ -109,11 +110,11 @@ class AsyncTask(Base):
     # 回调端点 token（不可预测，每任务一个；唯一索引支撑反查）
     callback_token: Mapped[str | None] = mapped_column(String(96), nullable=True, unique=True)
 
-    # create 请求摘要：list_and_match 确认用（存对象存储，行内只放 digest + 引用）
+    # create 请求摘要：list_and_match 确认用（请求体存 Redis，行内只放 digest + 引用）
     create_req_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
     create_req_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
-    # 结果：一律转存回引用（§12.2 result_policy）
+    # 结果：store 模式转存回引用（§12.2 result_policy；未配置对象存储 ⇒ 恒为空）
     result_ref: Mapped[str | None] = mapped_column(String(512), nullable=True)
     result_summary: Mapped[dict | None] = mapped_column(JSONType, nullable=True)
     result_degraded: Mapped[list | None] = mapped_column(JSONType, nullable=True)

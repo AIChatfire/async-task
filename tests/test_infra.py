@@ -259,3 +259,49 @@ def test_result_key_prefixes_creation_date():
         result_key("d", "t2", created_at=naive, attempt=3, ext="glb")
         == "20260920/d/t2/attempt-3.glb"
     )
+
+# __ 请求数据存储（create 请求体 / 响应存档；对象存储只服务转存） __
+
+
+async def test_request_store_roundtrip_and_missing():
+    from async_gateway.infra.request_store import (
+        MemoryRequestStore,
+        RequestDataNotFound,
+        body_ttl_seconds,
+        request_key,
+        response_key,
+        response_ttl_seconds,
+    )
+
+    store = MemoryRequestStore()
+    key = request_key("default", "t1")
+    assert key == "req:default:t1" and response_key("default", "t1") == "reqresp:default:t1"
+    await store.put_json(key, {"prompt": "你好"}, 60)
+    assert await store.get_bytes(key) == '{"prompt": "你好"}'.encode()
+
+    await store.drop(key)
+    with pytest.raises(RequestDataNotFound):
+        await store.get_bytes(key)
+
+    # TTL 由既有配置派生，不引入新开关
+    assert 300 <= body_ttl_seconds() <= 3600
+    assert response_ttl_seconds() >= 60
+
+
+def test_result_store_is_none_when_s3_unconfigured():
+    """未配置对象存储 ⇒ get_result_store() 返回 None（转存自动关闭的判据）。
+
+    测试基座把 S3_* 四项钉成空串（conftest）⇒ 这里断言的是"真实未配置"路径；
+    需要转存的用例走 result_store fixture 注入内存替身，与 S3_* 是否配置无关。
+    注意：**不要**在这里动 get_settings 的缓存（会话级 settings fixture 持有的是同一对象，
+    重置会让其它用例的 monkeypatch 打空）。
+    """
+    from async_gateway.config import get_settings
+    from async_gateway.infra.object_store import MemoryResultStore, get_result_store, set_result_store
+
+    assert get_settings().s3_configured is False
+    set_result_store(None)
+    try:
+        assert get_result_store() is None
+    finally:
+        set_result_store(MemoryResultStore())
