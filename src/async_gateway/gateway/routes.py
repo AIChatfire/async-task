@@ -4,9 +4,10 @@
 
 关键实现口径：
 
-* **响应形状保真**：面向 New API 的 create/get 响应就是上游原生形状——create 走
-  受理内同步透传（``submit_mode=inline``），get 走"快照优先 + 同步透传刷新"；
-  envelope 只在调用方显式要求（``X-AG-Envelope: 1``）时附加，且不改动原生体。
+* **响应形状**：get 响应就是上游原生形状——走"快照优先 + 同步透传刷新"；create 在默认
+  ``queued`` 受理下是网关形状（立刻 202，`id`/`task_id` = 网关任务 id，可按它回查），
+  ``inline`` 下受理内同步透传上游原生形状。envelope 只在调用方显式要求
+  （``X-AG-Envelope: 1``）时附加，且不改动原生体。
 * **未授权与不存在同返 404**：归属校验命中不到就 404，不区分"无权"与"不存在"，
   避免把任务 ID 空间变成可枚举的（§18.5 / 验收 9）。
 * **终态冲突仲裁**：``status_source=poll`` 时回调属兜底源，它判出的终态**不立即落库**，
@@ -175,6 +176,23 @@ async def _presigned_result_url(container: Container, task: AsyncTask, template)
         return None
 
 
+async def _find_task(channel: str, identifier: str) -> AsyncTask | None:
+    """按标识找任务：**上游 id 优先、网关 task_id 兜底**。
+
+    兜底是 ``queued``（默认）受理语义的配套：立刻 202 时上游 id 尚不存在，
+    调用方（含 New API 两族插件）拿到并回查的就是**网关任务 id**。
+    归属（channel/tenant）仍由 ``container.assert_owned`` 收口。
+    """
+    async with session_scope() as s:
+        dao = TaskDAO(s)
+        task = await dao.find_by_upstream_id(channel, identifier)
+        if task is None:
+            by_id = await dao.get(identifier)
+            if by_id is not None and by_id.channel == channel:
+                task = by_id
+        return task
+
+
 async def _handle_query(
     container: Container,
     bus,
@@ -187,8 +205,7 @@ async def _handle_query(
     strategy = container.strategy_for(auth.channel, tv)
     min_refresh = float(strategy.get("min_refresh_interval", 3.0))
 
-    async with session_scope() as s:
-        task = await TaskDAO(s).find_by_upstream_id(auth.channel, upstream_id)
+    task = await _find_task(auth.channel, upstream_id)
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")
     container.assert_owned(task, auth)
@@ -237,8 +254,7 @@ async def _handle_cancel(
     request: Request,
 ) -> Response:
     template = tv.resolved
-    async with session_scope() as s:
-        task = await TaskDAO(s).find_by_upstream_id(auth.channel, upstream_id)
+    task = await _find_task(auth.channel, upstream_id)
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")
     container.assert_owned(task, auth)

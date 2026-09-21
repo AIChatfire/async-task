@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Iterable, Sequence
 
-from sqlalchemy import Select, and_, func, insert, or_, select, update
+from sqlalchemy import Select, and_, case, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,6 +46,21 @@ ACTIVE_STATUSES: frozenset[TaskStatus] = frozenset(
         TaskStatus.FAILED,
     }
 )
+
+
+def _decremented_attempts():
+    """attempts 递减到 **不为负** —— 表达式必须跨方言可移植。
+
+    🔴 不能写 ``func.max(AsyncTask.attempts - 1, 0)``：SQLite 把双参 ``max(a, b)`` 当**标量**
+    函数（所以本地全套单测是绿的），PostgreSQL 只有**聚合** ``max()`` ⇒ 真库上直接
+    ``UndefinedFunctionError: function max(integer, integer) does not exist``，凡是
+    ``consumes_attempt=False`` 的退款路径（上游 429 / 401 / 403、poll 5xx / 409 冲突）
+    全部变成 500。2026-09-20 在 node-064 的 PG 16 上实测（livetest-ai 报告
+    `E2E-ASYNC-TASK-001` 的 F1）。
+    ``case(...)`` 在 SQLite / PostgreSQL 下语义一致，且有
+    ``tests/test_dao_sql.py`` 用 **postgresql 方言编译**钉住，防止回退。
+    """
+    return case(((AsyncTask.attempts - 1) > 0, AsyncTask.attempts - 1), else_=0)
 
 #: 状态 → 该派发什么任务（scheduler 用；accepted 不在其中，由 inspector 巡检重投）
 DISPATCH_BY_STATUS: dict[TaskStatus, str] = {
@@ -677,7 +692,7 @@ class TaskDAO:
             "retryable": retryable,
         }
         if decrement_attempts:
-            values["attempts"] = func.max(AsyncTask.attempts - 1, 0)
+            values["attempts"] = _decremented_attempts()
         if attributes:
             values["attributes"] = attributes
         return await self._cas(task_id, expected, values)

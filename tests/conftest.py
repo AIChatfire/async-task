@@ -16,6 +16,9 @@ os.environ.update(
     {
         "AG_APP_ENV": "test",
         "AG_DATABASE_URL": f"sqlite+aiosqlite:///{_TMP}/test.db",
+        # 本机 .env 里 AG_REDIS_URL 可能是生产占位符（<redis-host>）：显式钉住，测试不依赖它。
+        # 只有 redis 标记的用例会真的连它（其余全部走内存替身，见 is_test / uses_ephemeral_infra）。
+        "AG_REDIS_URL": "redis://localhost:6379/0",
         "AG_RESULT_STORE_MODE": "memory",
         # 注意与上一行的区别：这一项是"结果**策略**模式"（store/passthrough）。
         # 既有用例假定"成功即转存"（store），故测试环境显式指定；
@@ -29,6 +32,9 @@ os.environ.update(
         "AG_CALLBACK_BASE_URL": "http://gw.test",
         "AG_ADMIN_TOKEN": "test-admin",
         "AG_URL_DIRECT_CONFIG_ENABLED": "true",
+        # 既有用例全部按 inline（受理内同步 create）语义写：这里显式钉住。
+        # "默认是 queued"由 tests/test_submit_mode.py 单独守住（含模型默认值断言）。
+        "AG_SUBMIT_MODE": "inline",
         "AG_MAX_ATTEMPTS": "3",
         "AG_TASK_DEADLINE_SECONDS": "600",
         "AG_UNKNOWN_MAX_LIFETIME_SECONDS": "3600",

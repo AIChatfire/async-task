@@ -112,10 +112,14 @@ class Settings(BaseSettings):
     auth_mode: Literal["passthrough", "admin"] = "passthrough"
     ownership_check: bool = True
     upstream_auth_header: str = "Authorization"
-    # 受理时是否同步调用上游创建：
-    #   inline —— 受理请求内完成 create（凭证不出请求、响应天然是上游原生形状，推荐）
-    #   queued —— 落库后由 worker 异步 create（需要短生命周期凭证驻留，见 infra/credentials）
-    submit_mode: Literal["inline", "queued"] = "inline"
+    # 受理模式（2026-09-21 反转裁定，见 docs/IMPLEMENTATION.md §3.1）：
+    #   queued —— **不等上游**：受理只落库 + 入队，立刻返回 202 `{"id","task_id","status"}`，
+    #             上游 create 由 worker 后台完成（需要短生命周期凭证驻留，见 infra/credentials）。
+    #             响应里的 id 是**网关任务 id**（提交时上游 id 还不存在），New API 两族插件
+    #             （ark 系认 body.id / generic-async-v1 认 task_id||id）都能解析并按它查询。
+    #   inline —— 受理请求内同步完成 create：返回上游原生形状（上游 id 原样透出）；
+    #             上游受理慢会拖慢受理，仅"必须同步拿上游原生响应"的场景显式配置。
+    submit_mode: Literal["inline", "queued"] = "queued"
     # 数据面凭证的短生命周期存放后端：redis_ephemeral | memory | none
     credential_channel: Literal["redis_ephemeral", "memory", "none"] = "redis_ephemeral"
 

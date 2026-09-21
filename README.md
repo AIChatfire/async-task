@@ -14,7 +14,7 @@
 
 | 语义 | 说明 |
 |---|---|
-| 提交 | `POST /async/{alias}/{上游 create_path}`，返回**上游原生形状**的受理响应（New API 依赖它解析上游 task id） |
+| 提交 | `POST /async/{alias}/{上游 create_path}`。**默认 `queued`：不等上游，立刻 202**——`{"id","task_id","status":"queued"}`（`id` = 网关任务 id，New API 两族插件均可解析），上游创建由 worker 后台完成；`AG_SUBMIT_MODE=inline` 时受理内同步创建、返回上游原生形状 |
 | 查询 | `GET /async/{alias}/{上游 get 路径}`，快照优先 + 客户端带凭证时同步透传刷新 |
 | 取消 | `DELETE /async/{alias}/{上游取消路径}`，上游不支持则降级为 `cancel_requested` |
 | 回调 | `POST /callbacks/{opaque_token}`，HMAC 验签 + 时间窗 + 去重表 |

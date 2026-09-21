@@ -149,8 +149,16 @@ curl -X POST http://<newapi>/volcengine/3d/api/v3/contents/generations/tasks \
 > 「任务 succeeded 但结果取不到」（当时表现为转存永久失败 + 结果端点 410；该中转端点现已移除，
 > 见 `IMPLEMENTATION.md` §3.14）。
 
-网关侧「原生形状保真」意味着：New API 看到的是**上游原生响应形状**（envelope 只给网关自有调用方），
-内部终态（timeout/dead/dead_awaiting_confirm）会按模板映射重写为上游原生失败类取值 —— 退款链路才触发。
+网关侧「形状契约」意味着：New API 看到的**查询响应**始终是上游原生形状（envelope 只给网关自有
+调用方），内部终态（timeout/dead/dead_awaiting_confirm）会按模板映射重写为上游原生失败类取值 ——
+退款链路才触发。
+
+> **2026-09-21 起受理默认 `queued`（不等上游、立刻 202）**：提交响应是网关形状
+> `{"id","task_id","status":"queued"}`——`id`/`task_id` 为**网关任务 id**（提交时上游 id 尚不存在），
+> 两族插件均可解析（ark 系取 `body.id`，generic-async-v1 取 `task_id || id`），随后按该 id 查询
+> 即可命中（查询面：上游 id 优先、网关 task id 兜底；预创建期查询响应会合成 `queued` 状态词）。
+> 需要"受理内同步创建、上游 id 原样透出"时，显式配置 `AG_SUBMIT_MODE=inline`。
+> 配套说明见 `IMPLEMENTATION.md` §3.1。
 
 ---
 
@@ -224,6 +232,9 @@ AG_RESULT_MODE_DEFAULT=store     # 全局切回；或按模板显式 result_poli
 ---
 
 ## 8. 真机实测记录（2026-09-20）
+
+> 注：本次实测时受理语义为 `inline`（同步创建、返回上游原生形状）——下表"受理"一行描述的是
+> `inline` 形态。2026-09-21 起默认改为 `queued`（立刻 202，见 §4 注与 `IMPLEMENTATION.md` §3.1）。
 
 **被测链路**：`POST /async/volc-seed3d/api/v3/contents/generations/tasks`（即 New API 插件会拼出的同一路径）
 → 火山方舟 `doubao-seed3d-2-0-260328`，图片用方舟文档示例图，参数 `--subdivisionlevel high --fileformat obj`。

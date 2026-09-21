@@ -12,8 +12,9 @@
 
 另外两条容易被忽略的硬规则：
 
-* **响应形状保真**：面向 New API 的 create/get 响应必须是上游原生形状（envelope 只给
-  网关自有调用方）。所以这里做的是"在原生形状上就地重写字段"，而不是包一层。
+* **响应形状保真（查询面）**：get 响应保持上游原生形状（envelope 只给网关自有调用方）——
+  所以这里做的是"在原生形状上就地重写字段"，而不是包一层。create 响应在默认 ``queued``
+  受理下是网关形状 + 可解析 id（见 docs/IMPLEMENTATION.md §3.1），``inline`` 下仍是原生形状。
 * **转存永久失败的上游成功任务报 succeeded + 结果不可用**：状态字段 = 上游原生成功终态，
   结果字段重写为网关结果端点 URL（该 URL 返回 410 语义）——New API 按成功正常结算，
   用户取结果时得到明确不可用信号；平台承担上游成本，不伪造失败骗退款。
@@ -134,6 +135,15 @@ def native_snapshot(task: AsyncTask) -> Any:
     return {}
 
 
+#: 预创建期/首次轮询前的**非终态占位取值**（对外词表）。
+#:
+#: ``queued``（默认）受理下，任务可能在还没有任何上游状态时就被查询（立刻 202 之后、
+#: worker 完成 create 之前）。没有这个占位，响应会是空体 ``{}``，New API 侧宽映射读不到
+#: 状态即判 UNKNOWN（generic-async-v1 会直接判失败）。``queued`` 在两族插件词表里都归属
+#: "进行中"，是最安全的占位。
+_PENDING_PLACEHOLDER_STATUS = "queued"
+
+
 def _effective_status_value(task: AsyncTask, template: ResolvedTemplate) -> tuple[str | None, bool]:
     """返回 ``(要写入的原生状态值, 是否需要重写)``。
 
@@ -157,6 +167,10 @@ def _effective_status_value(task: AsyncTask, template: ResolvedTemplate) -> tupl
         if native in failure_values and status is TaskStatus.TIMEOUT and native in template.terminal.expired:
             return native, False
         return effective_failure_status(template), True
+    if native is None:
+        # 非终态但还没有任何上游侧状态（queued 默认下的预创建窗口 / 首次轮询前）：
+        # 合成占位取值，别让调用方读到"没有状态"（详见常量注释）。
+        return _PENDING_PLACEHOLDER_STATUS, True
     return native, False
 
 

@@ -5,12 +5,13 @@
 1. **先落库后入队**：库里先有行，才有真相；
 2. **幂等键窗口期内唯一**：显式键优先，否则派生 ``key_hash + 请求体规范化哈希``；
    窗口期内同键同体 → 原样重放（返回同一份上游响应）；同键异体 → 409；
-3. **响应形状保真**：面向 New API 的 create 响应必须是**上游原生形状**，否则 New API 的
-   上游 adaptor 解析不出上游 task id，整条链路就断了。
-
-第 3 点决定了默认 ``submit_mode=inline``：受理请求内同步完成上游 create，凭证不经手
-任何持久化介质，响应天然就是上游原生响应。``queued`` 模式保留给"受理延迟优先"的场景
-（需要短生命周期凭证驻留，见 ``infra/credentials``）。
+3. **响应体必须让调用方"接得上"**：默认 ``queued``（2026-09-21 裁定，见
+   docs/IMPLEMENTATION.md §3.1）——**不等上游**：受理只落库 + 入队，立刻返回 202
+   ``{"id", "task_id", "status"}``（``id`` = **网关任务 id**；New API ark 系插件认
+   ``body.id``、``generic-async-v1`` 认 ``task_id || id``），上游 create 由 worker
+   后台完成（凭证需短生命周期驻留，见 ``infra/credentials``）；调用方随后按该 id 查询
+   （查询面：上游 id 优先、网关 task_id 兜底）。``inline`` 保留给"必须同步拿到上游原生
+   响应"的场景：受理请求内同步 create，凭证不经手任何持久化介质，响应天然是上游原生响应。
 """
 
 from __future__ import annotations
@@ -164,11 +165,19 @@ async def accept_create(
     await _audit_accept(auth, task_id, tv, idem, origin)
 
     if container.settings.submit_mode == "queued":
+        # 不等上游：落库 + 入队即返回 202。``id`` 与 ``task_id`` 同值（网关任务 id）——
+        # ark 系插件只认 ``body.id``，generic-async-v1 认 ``task_id || id``，两者都接得上；
+        # ``status`` 取对外词表值（queued ∈ 两族插件的宽映射，且与查询面预创建期占位一致，
+        # 见 output._PENDING_PLACEHOLDER_STATUS），不暴露内部状态名。
         await bus.enqueue("submit:default", "submit_upstream", {"task_id": task_id})
         return AcceptResult(
             task_id=task_id,
             http_status=202,
-            body={"task_id": task_id, "status": TaskStatus.ACCEPTED.value},
+            body={"id": task_id, "task_id": task_id, "status": "queued"},
+            headers={
+                "X-AG-Task-Id": task_id,
+                "X-AG-Internal-Status": TaskStatus.ACCEPTED.value,
+            },
             replayed=False,
         )
 
@@ -315,10 +324,12 @@ async def _replay_or_conflict(container: Container, existing: AsyncTask, digest:
     except Exception:  # noqa: BLE001 - 响应还没落盘（inline 尚未完成）时退化为 202
         stored = {}
     if not stored or stored.get("pending"):
+        # 响应尚未落盘（queued 默认下很常见：受理已返回、worker 还在后台创建）→ 202 + 重放标。
+        # 同带 ``id``：ark 系插件只认 ``body.id``，重放分支漏了它会让幂等重试整条失败。
         return AcceptResult(
             task_id=existing.task_id,
             http_status=202,
-            body={"task_id": existing.task_id, "status": existing.status},
+            body={"id": existing.task_id, "task_id": existing.task_id, "status": existing.status},
             headers={"X-AG-Task-Id": existing.task_id, "X-AG-Idempotent-Replay": "1"},
             replayed=True,
         )
