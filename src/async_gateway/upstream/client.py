@@ -53,6 +53,36 @@ class UpstreamResponse:
         return redact_headers(self.headers)
 
 
+def _error_detail_suffix(up: UpstreamResponse, limit: int = 180) -> str:
+    """上游 4xx/5xx 的**可读原因**后缀（已过 scrub，可安全入库/外显）。
+
+    提取顺序：JSON ``error.message`` / ``error.code`` → ``message`` / ``detail`` /
+    ``msg`` → 响应文本首行；统一压空白并截断。取不到时返回空串 —— 保持旧的
+    ``upstream HTTP <code>`` 形态，不退化成"多一个空冒号"。
+    """
+    candidates: list[Any] = []
+    body = up.json_body if isinstance(up.json_body, dict) else None
+    if body:
+        err = body.get("error")
+        if isinstance(err, dict):
+            candidates.append(err.get("message"))
+            candidates.append(err.get("msg"))
+            candidates.append(err.get("code"))
+        elif isinstance(err, str):
+            candidates.append(err)
+        candidates.append(body.get("message"))
+        candidates.append(body.get("msg"))
+        candidates.append(body.get("detail"))
+    lines = (up.text or "").strip().splitlines()
+    if lines:
+        candidates.append(lines[0])
+    for raw in candidates:
+        value = str(raw).strip() if raw else ""
+        if value:
+            return ": " + " ".join(value.split())[:limit]
+    return ""
+
+
 @dataclass(slots=True)
 class UpstreamCallResult:
     outcome: Outcome
@@ -253,7 +283,7 @@ class UpstreamClient:
             outcome="http_error",
             response=up,
             classification=classification,
-            error=f"upstream HTTP {up.status_code}",
+            error=f"upstream HTTP {up.status_code}{_error_detail_suffix(up)}",
             retry_after=extract_retry_after(up.headers) if up.status_code == 429 else None,
             target=target,
         )

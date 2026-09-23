@@ -237,8 +237,11 @@ def build_native_query_response(
     elif is_internal_terminal(status) or status is TaskStatus.CANCELLED:
         error_field = template.terminal.error_field
         if error_field:
+            # 优先透出**具体失败原因**（task.error_message，如 "upstream HTTP 400: <上游说明>"）；
+            # 没有则回退错误码取值（保持既有行为）。2026-09-24：错误原因不再止步于网关。
+            detail = (task.error_message or "").strip() or effective_failure_error_code(template)
             try:
-                set_path_on_doc(snapshot, error_field, effective_failure_error_code(template))
+                set_path_on_doc(snapshot, error_field, detail)
             except PathWriteSkipped:
                 pass
         if template.result_policy.mode is ResultMode.STORE:
